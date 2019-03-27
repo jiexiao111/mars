@@ -37,14 +37,14 @@
 #endif
 
 void log_formater(const XLoggerInfo* _info, const char* _logbody, PtrBuffer& _log) {
-    static const char* levelStrings[] = {
-        "V",
-        "D",  // debug
-        "I",  // info
-        "W",  // warn
-        "E",  // error
-        "F"  // fatal
-    };
+//    static const char* levelStrings[] = {
+//        "V",
+//        "D",  // debug
+//        "I",  // info
+//        "W",  // warn
+//        "E",  // error
+//        "F"  // fatal
+//    };
 
     assert((unsigned int)_log.Pos() == _log.Length());
 
@@ -69,7 +69,7 @@ void log_formater(const XLoggerInfo* _info, const char* _logbody, PtrBuffer& _lo
     }
 
     if (NULL != _info) {
-        const char* filename = ExtractFileName(_info->filename);
+//        const char* filename = ExtractFileName(_info->filename);
         char strFuncName [128] = {0};
         ExtractFunctionName(_info->func_name, strFuncName, sizeof(strFuncName));
 
@@ -79,8 +79,12 @@ void log_formater(const XLoggerInfo* _info, const char* _logbody, PtrBuffer& _lo
             time_t sec = _info->timeval.tv_sec;
             tm tm = *localtime((const time_t*)&sec);
 #ifdef ANDROID
-            snprintf(temp_time, sizeof(temp_time), "%d-%02d-%02d %+.1f %02d:%02d:%02d.%.3ld", 1900 + tm.tm_year, 1 + tm.tm_mon, tm.tm_mday,
-                     tm.tm_gmtoff / 3600.0, tm.tm_hour, tm.tm_min, tm.tm_sec, _info->timeval.tv_usec / 1000);
+            // xlog实现
+//            snprintf(temp_time, sizeof(temp_time), "%d-%02d-%02d %+.1f %02d:%02d:%02d.%.3ld", 1900 + tm.tm_year, 1 + tm.tm_mon, tm.tm_mday,
+//                     tm.tm_gmtoff / 3600.0, tm.tm_hour, tm.tm_min, tm.tm_sec, _info->timeval.tv_usec / 1000);
+            // logsdk实现
+            snprintf(temp_time, sizeof(temp_time), "%d-%02d-%02d %02d:%02d:%02d.%.3ld", 1900 + tm.tm_year, 1 + tm.tm_mon, tm.tm_mday,
+                     tm.tm_hour, tm.tm_min, tm.tm_sec, _info->timeval.tv_usec / 1000);
 #elif _WIN32
             snprintf(temp_time, sizeof(temp_time), "%d-%02d-%02d %+.1f %02d:%02d:%02d.%.3d", 1900 + tm.tm_year, 1 + tm.tm_mon, tm.tm_mday,
                      (-_timezone) / 3600.0, tm.tm_hour, tm.tm_min, tm.tm_sec, _info->timeval.tv_usec / 1000);
@@ -91,10 +95,14 @@ void log_formater(const XLoggerInfo* _info, const char* _logbody, PtrBuffer& _lo
         }
 
         // _log.AllocWrite(30*1024, false);
-        int ret = snprintf((char*)_log.PosPtr(), 1024, "[%s][%s][%" PRIdMAX ", %" PRIdMAX "%s][%s][%s, %s, %d][",  // **CPPLINT SKIP**
-                           _logbody ? levelStrings[_info->level] : levelStrings[kLevelFatal], temp_time,
-                           _info->pid, _info->tid, _info->tid == _info->maintid ? "*" : "", _info->tag ? _info->tag : "",
-                           filename, strFuncName, _info->line);
+        // xlog原始实现
+//        int ret = snprintf((char*)_log.PosPtr(), 1024, "[%s][%s][%" PRIdMAX ", %" PRIdMAX "%s][%s][%s, %s, %d][",  // **CPPLINT SKIP**
+//                           _logbody ? levelStrings[_info->level] : levelStrings[kLevelFatal], temp_time,
+//                           _info->pid, _info->tid, _info->tid == _info->maintid ? "*" : "", _info->tag ? _info->tag : "",
+//                           filename, strFuncName, _info->line);
+        // 修改logsdk实现格式
+        int ret = snprintf((char*)_log.PosPtr(), 1024, "%s\t%" PRIdMAX "%s\t%s\t%s\t%d\t",
+                           temp_time, _info->tid, _info->tid == _info->maintid ? "*" : "", "6",  _info->tag ? _info->tag : "", _info->line);
 
         assert(0 <= ret);
         _log.Length(_log.Pos() + ret, _log.Length() + ret);

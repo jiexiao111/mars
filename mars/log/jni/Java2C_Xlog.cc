@@ -24,13 +24,13 @@
 #include "mars/log/appender.h"
 
 #define LONGTHREADID2INT(a) ((a >> 32)^((a & 0xFFFF)))
-DEFINE_FIND_CLASS(KXlog, "com/tencent/mars/xlog/Xlog")
+DEFINE_FIND_CLASS(KXlog, "com/tencent/mtt/log/engine/Xlog")
 
 extern "C" {
 
-DEFINE_FIND_STATIC_METHOD(KXlog_appenderOpenWithMultipathWithLevel, KXlog, "appenderOpen", "(IILjava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;)V")
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_appenderOpen
-	(JNIEnv *env, jclass, jint level, jint mode, jstring _cache_dir, jstring _log_dir, jstring _nameprefix, jint _cache_log_days, jstring _pubkey) {
+DEFINE_FIND_STATIC_METHOD(KXlog_appenderOpenWithMultipathWithLevel, KXlog, "appenderOpen", "(IILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V")
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_appenderOpen
+		(JNIEnv *env, jclass, jint level, jint mode, jstring _cache_dir, jstring _log_dir, jstring _nameprefix, jstring _pubkey, jstring _log_head_info) {
 	if (NULL == _log_dir || NULL == _nameprefix) {
 		return;
 	}
@@ -47,18 +47,26 @@ JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_appenderOpen
 		pubkey = jstr_pubkey.GetChar();
 	}
 
+	//cirodeng-20180524:add log head info param
+	const char* log_head_info = NULL;
+	ScopedJstring jstr_log_head_info(env, _log_head_info);
+	if (NULL != _log_head_info) {
+		log_head_info = jstr_log_head_info.GetChar();
+	}
+
 	ScopedJstring log_dir_jstr(env, _log_dir);
 	ScopedJstring nameprefix_jstr(env, _nameprefix);
-	appender_open_with_cache((TAppenderMode)mode, cache_dir.c_str(), log_dir_jstr.GetChar(), nameprefix_jstr.GetChar(), _cache_log_days, pubkey);
+    //cirodeng-20180524:add log head info param
+	appender_open_with_cache((TAppenderMode)mode, cache_dir.c_str(), log_dir_jstr.GetChar(), nameprefix_jstr.GetChar(), 0, pubkey, log_head_info);
 	xlogger_SetLevel((TLogLevel)level);
 
 }
 
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_appenderClose(JNIEnv *env, jobject) {
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_appenderClose(JNIEnv *env, jobject) {
 	appender_close();
 }
 
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_appenderFlush(JNIEnv *env, jobject, jboolean _is_sync) {
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_appenderFlush(JNIEnv *env, jobject, jboolean _is_sync) {
 	if (_is_sync) {
 		appender_flush_sync();
 	} else {
@@ -66,9 +74,9 @@ JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_appenderFlush(JNIEnv *env
 	}
 }
 
-DEFINE_FIND_STATIC_METHOD(KXlog_logWrite, KXlog, "logWrite", "(Lcom/tencent/mars/xlog/Xlog$XLoggerInfo;Ljava/lang/String;)V")
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_logWrite
-  (JNIEnv *env, jclass, jobject _log_info, jstring _log) {
+DEFINE_FIND_STATIC_METHOD(KXlog_logWrite, KXlog, "logWrite", "(Lcom/tencent/mtt/log/engine/Xlog$XLoggerInfo;Ljava/lang/String;)V")
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_logWrite
+		(JNIEnv *env, jclass, jobject _log_info, jstring _log) {
 
 	if (NULL == _log_info || NULL == _log) {
 		xerror2(TSF"loginfo or log is null");
@@ -111,9 +119,9 @@ JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_logWrite
 }
 
 DEFINE_FIND_STATIC_METHOD(KXlog_logWrite2, KXlog, "logWrite2", "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;IIJJLjava/lang/String;)V")
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_logWrite2
-  (JNIEnv *env, jclass, int _level, jstring _tag, jstring _filename,
-		  jstring _funcname, jint _line, jint _pid, jlong _tid, jlong _maintid, jstring _log) {
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_logWrite2
+		(JNIEnv *env, jclass, int _level, jstring _tag, jstring _filename,
+		 jstring _funcname, jint _line, jint _pid, jlong _tid, jlong _maintid, jstring _log) {
 
 	if (!xlogger_IsEnabledFor((TLogLevel)_level)) {
 		return;
@@ -171,37 +179,37 @@ JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_logWrite2
 	}
 }
 
-JNIEXPORT jint JNICALL Java_com_tencent_mars_xlog_Xlog_getLogLevel
-  (JNIEnv *, jobject) {
+JNIEXPORT jint JNICALL Java_com_tencent_mtt_log_engine_Xlog_getLogLevel
+		(JNIEnv *, jobject) {
 	return xlogger_Level();
 }
 
-//DEFINE_FIND_STATIC_METHOD(KXlog_setLogLevel, KXlog, "setLogLevel", "(I)V")
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_setLogLevel
-  (JNIEnv *, jclass, jint _log_level) {
+DEFINE_FIND_STATIC_METHOD(KXlog_setLogLevel, KXlog, "setLogLevel", "(I)V")
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_setLogLevel
+		(JNIEnv *, jclass, jint _log_level) {
 	xlogger_SetLevel((TLogLevel)_log_level);
 }
 
 DEFINE_FIND_STATIC_METHOD(KXlog_setAppenderMode, KXlog, "setAppenderMode", "(I)V")
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_setAppenderMode
-  (JNIEnv *, jclass, jint _mode) {
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_setAppenderMode
+		(JNIEnv *, jclass, jint _mode) {
 	appender_setmode((TAppenderMode)_mode);
 }
 
 DEFINE_FIND_STATIC_METHOD(KXlog_setConsoleLogOpen, KXlog, "setConsoleLogOpen", "(Z)V")
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_setConsoleLogOpen
-  (JNIEnv *env, jclass, jboolean _is_open) {
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_setConsoleLogOpen
+		(JNIEnv *env, jclass, jboolean _is_open) {
 	appender_set_console_log((bool)_is_open);
 }
 
 DEFINE_FIND_STATIC_METHOD(KXlog_setMaxFileSize, KXlog, "setMaxFileSize", "(J)V")
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_setMaxFileSize
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_setMaxFileSize
 		(JNIEnv *env, jclass, jlong _maxSize) {
 	appender_set_max_file_size(_maxSize);
 }
 
 DEFINE_FIND_STATIC_METHOD(KXlog_setMaxAliveTime, KXlog, "setMaxAliveTime", "(J)V")
-JNIEXPORT void JNICALL Java_com_tencent_mars_xlog_Xlog_setMaxAliveTime
+JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_setMaxAliveTime
 		(JNIEnv *env, jclass, jlong _maxTime) {
     appender_set_max_alive_duration(_maxTime);
 }

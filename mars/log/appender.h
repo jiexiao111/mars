@@ -32,8 +32,9 @@ enum TAppenderMode
 };
 
 void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefix, const char* _pub_key);
+//cirodeng-20180524:add log head info param
 void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir, const std::string& _logdir,
-                              const char* _nameprefix, int _cache_days, const char* _pub_key);
+                              const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info);
 void appender_flush();
 void appender_flush_sync();
 void appender_close();

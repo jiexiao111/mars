@@ -44,6 +44,7 @@
 
 #include <unistd.h>
 #include <zlib.h>
+/* #include <android/log.h> */
 
 #include <string>
 #include <algorithm>
@@ -73,7 +74,7 @@
 
 #include "log_buffer.h"
 
-#define LOG_EXT "xlog"
+#define LOG_EXT "qlog"
 
 extern void log_formater(const XLoggerInfo* _info, const char* _logbody, PtrBuffer& _log);
 extern void ConsoleLog(const XLoggerInfo* _info, const char* _log);
@@ -81,6 +82,7 @@ extern void ConsoleLog(const XLoggerInfo* _info, const char* _log);
 static TAppenderMode sg_mode = kAppednerAsync;
 
 static std::string sg_logdir;
+static std::string sg_log_head_info;//cirodeng-20180524:add log head info param
 static std::string sg_cache_logdir;
 static std::string sg_logfileprefix;
 
@@ -147,8 +149,9 @@ static std::string __make_logfilenameprefix(const timeval& _tv, const char* _pre
     tm tcur = *localtime((const time_t*)&sec);
     
     char temp [64] = {0};
-    snprintf(temp, 64, "_%d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon, tcur.tm_mday);
-    
+//    snprintf(temp, 64, "_%d%02d%02d%02d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon, tcur.tm_mday, tcur.tm_hour, tcur.tm_min, tcur.tm_sec);
+    snprintf(temp, 64, "_%d%02d%02d%02d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon, tcur.tm_mday, tcur.tm_hour, 0, 0);//配合logsdk按照小时分割日志，分和秒变为0
+
     std::string filenameprefix = _prefix;
     filenameprefix += temp;
     
@@ -284,6 +287,7 @@ static void __del_timeout_file(const std::string& _log_path) {
 }
 
 static bool __append_file(const std::string& _src_file, const std::string& _dst_file) {
+
     if (_src_file == _dst_file) {
         return false;
     }
@@ -475,6 +479,12 @@ static bool __openlogfile(const std::string& _log_dir) {
         __writetips2console("open file error:%d %s, path:%s", errno, strerror(errno), logfilepath);
     }
 
+    //cirodeng-20180524:add common info in the head of each logfile(not encrypted)
+    char common_log[4096] = {0};
+    snprintf(common_log, sizeof(common_log), "%s\n", sg_log_head_info.c_str());
+    AutoBuffer tmp_common_buff;
+    sg_log_buff->Write(common_log, strnlen(common_log, sizeof(common_log)), tmp_common_buff);
+    __writefile(tmp_common_buff.Ptr(), tmp_common_buff.Length(), sg_logfile);
 
     if (0 != s_last_time && (now_time - s_last_time) > (time_t)((now_tick - s_last_tick) / 1000 + 300)) {
 
@@ -714,10 +724,12 @@ void xlogger_appender(const XLoggerInfo* _info, const char* _log) {
             free(strrecursion);
         }
 
-        if (kAppednerSync == sg_mode)
+        if (kAppednerSync == sg_mode) {
             __appender_sync(_info, _log);
-        else
+        }
+        else {
             __appender_async(_info, _log);
+        }
     }
 }
 
@@ -912,12 +924,13 @@ void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefi
 }
 
 void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir, const std::string& _logdir,
-                              const char* _nameprefix, int _cache_days, const char* _pub_key) {
+                              const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info) {
     assert(!_cachedir.empty());
     assert(!_logdir.empty());
     assert(_nameprefix);
 
     sg_logdir = _logdir;
+    sg_log_head_info = _log_head_info;//cirodeng-20180524:add log head info param
     sg_cache_log_days = _cache_days;
 
     if (!_cachedir.empty()) {
@@ -1056,9 +1069,10 @@ bool appender_make_logfile_name(int _timespan, const char* _prefix, std::vector<
     
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    tv.tv_sec -= _timespan * (24 * 60 * 60);
-    
-    char log_path[2048] = { 0 };
+//    tv.tv_sec -= _timespan * (24 * 60 * 60);// xlog分割按照每天
+    tv.tv_sec -= _timespan * (1 * 60 * 60);// logsdk分割按照每小时
+
+    char log_path[2048] = {0};
     __make_logfilename(tv, sg_logdir, _prefix, LOG_EXT, log_path, sizeof(log_path));
     
     if (sg_cache_logdir.empty()) {
