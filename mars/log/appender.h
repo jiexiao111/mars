@@ -25,6 +25,15 @@
 #include <vector>
 #include <stdint.h>
 
+#include "boost/bind.hpp"
+#include "boost/iostreams/device/mapped_file.hpp"
+#include "boost/filesystem.hpp"
+
+#include "mars/comm/thread/lock.h"
+#include "mars/comm/xlogger/xloggerbase.h"
+
+#include "log_buffer.h"
+
 enum TAppenderMode
 {
     kAppednerAsync,
@@ -33,13 +42,15 @@ enum TAppenderMode
 
 void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefix, const char* _pub_key);
 //cirodeng-20180524:add log head info param
-void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir, const std::string& _logdir,
-                              const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info);
+void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir,
+        const std::string& _logdir, const char* _nameprefix, int _cache_days,
+        const char* _pub_key, const char* _log_head_info);
 void appender_flush();
 void appender_flush_sync();
 void appender_close();
 void appender_setmode(TAppenderMode _mode);
-bool appender_getfilepath_from_timespan(int _timespan, const char* _prefix, std::vector<std::string>& _filepath_vec);
+bool appender_getfilepath_from_timespan(int _timespan, const char* _prefix,
+        std::vector<std::string>& _filepath_vec);
 bool appender_make_logfile_name(int _timespan, const char* _prefix, std::vector<std::string>& _filepath_vec);
 bool appender_get_current_log_path(char* _log_path, unsigned int _len);
 bool appender_get_current_log_cache_path(char* _logPath, unsigned int _len);
@@ -58,5 +69,60 @@ void appender_set_max_file_size(uint64_t _max_byte_size);
  * @param _max_time    Max alive duration of a single log file in seconds, default is 10 days
  */
 void appender_set_max_alive_duration(long _max_time);
+
+class LogAppender {
+
+    public:
+
+        LogAppender(int key);
+        ~LogAppender();
+
+        void appender_sync(const XLoggerInfo* _info, const char* _log);
+        void appender_async(const XLoggerInfo* _info, const char* _log);
+
+        void writetips2file(const char* _tips_format, ...);
+        void log2file(const void* _data, size_t _len, bool _move_file);
+
+        bool init_buff(const char* _dir, const char* _nameprefix, const char* _pub_key);
+        bool deinit_buff();
+
+        LogBuffer *m_log_buff;
+        bool m_log_close;
+        Mutex m_mutex_buffer_async;
+
+    private:
+
+        bool __openlogfile(const std::string& _log_dir);
+        void __closelogfile();
+
+        void __make_logfilename(const timeval& _tv, const std::string& _logdir,
+                const char* _prefix, const std::string& _fileext, char* _filepath, unsigned int _len);
+        std::string __make_logfilenameprefix(const timeval& _tv, const char* _prefix);
+        long __get_next_fileindex(const std::string& _fileprefix, const std::string& _fileext);
+        void __get_filenames_by_prefix(const std::string& _logdir, const std::string& _fileprefix,
+                const std::string& _fileext, std::vector<std::string>& _filename_vec);
+
+        bool __cache_logs();
+
+        bool __writefile(const void* _data, size_t _len, FILE* _file);
+
+    private:
+
+        int m_key;
+
+        boost::iostreams::mapped_file *m_mmmap_file;
+
+        FILE *m_logfile;
+        time_t m_openfiletime;
+        std::string m_current_dir;
+
+        char* m_buffer;
+
+        time_t m_last_time;
+        uint64_t m_last_tick;
+        char m_last_file_path[1024];
+
+        bool m_use_mmap;
+};
 
 #endif /* APPENDER_H_ */
