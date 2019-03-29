@@ -45,7 +45,6 @@
 
 #include <unistd.h>
 #include <zlib.h>
-#include <android/log.h>
 
 #include <algorithm>
 
@@ -109,24 +108,35 @@ TKey_Logappender_Map sg_key_logappender_map;
 typedef std::pair<int, LogAppender *> TKey_Logappender_Pair;
 
 namespace {
-class ScopeErrno {
-  public:
-    ScopeErrno() {m_errno = errno;}
-    ~ScopeErrno() {errno = m_errno;}
+    class ScopeErrno {
+        public:
+            ScopeErrno() {m_errno = errno;}
+            ~ScopeErrno() {errno = m_errno;}
 
-  private:
-    ScopeErrno(const ScopeErrno&);
-    const ScopeErrno& operator=(const ScopeErrno&);
+        private:
+            ScopeErrno(const ScopeErrno&);
+            const ScopeErrno& operator=(const ScopeErrno&);
 
-  private:
-    int m_errno;
-};
+        private:
+            int m_errno;
+    };
 
 #define SCOPE_ERRNO() SCOPE_ERRNO_I(__LINE__)
 #define SCOPE_ERRNO_I(line) SCOPE_ERRNO_II(line)
 #define SCOPE_ERRNO_II(line) ScopeErrno __scope_errno_##line
-
 }
+
+/* 调试日志 */
+#define TRACE_CALL
+#ifdef TRACE_CALL
+#include <android/log.h>
+#define __TRACE_INFO(...) __android_log_print(ANDROID_LOG_INFO, __FILE__, __VA_ARGS__);
+#define __TARCE_FORMAT(__fmt__) "[%s:%d] " __fmt__
+#define TRACE_INFO(__fmt__, ...) \
+    __TRACE_INFO(__TARCE_FORMAT(__fmt__), __func__, __LINE__, ##__VA_ARGS__);
+#else
+#define TRACE_INFO(fmt, ...) ((void)0)
+#endif
 
 static bool __string_compare_greater(const std::string& s1, const std::string& s2) {
     if (s1.length() == s2.length()) {
@@ -135,22 +145,27 @@ static bool __string_compare_greater(const std::string& s1, const std::string& s
     return s1.length() > s2.length();
 }
 
-/* TODO 确认删除规则 */
 static void __del_timeout_file(const std::string& _log_path) {
+    TRACE_INFO("%s", "start");
+
+    /* 遍历删除过期文件及目录 */
     time_t now_time = time(NULL);
-    
     boost::filesystem::path path(_log_path);
-    
     if (boost::filesystem::exists(path) && boost::filesystem::is_directory(path)){
         boost::filesystem::directory_iterator end_iter;
         for (boost::filesystem::directory_iterator iter(path); iter != end_iter; ++iter) {
             time_t file_modify_time = boost::filesystem::last_write_time(iter->path());
-            
+
+            /* 最近修改时间大于 1~10 天 */
             if (now_time > file_modify_time && now_time - file_modify_time > sg_max_alive_time) {
+
+                /* 后缀为 .qlog 的文件以及目录名为 8 个数字的目录 */
                 if(boost::filesystem::is_regular_file(iter->status())
-                && iter->path().extension() == (std::string(".") + LOG_EXT)) {
+                        && iter->path().extension() == (std::string(".") + LOG_EXT)) {
                     boost::filesystem::remove(iter->path());
                 } 
+
+                /* 目录名为 8 个数字的目录 */
                 if (boost::filesystem::is_directory(iter->status())) {
                     std::string filename = iter->path().filename().string();
                     if (filename.size() == 8 && filename.find_first_not_of("0123456789") == std::string::npos) {
@@ -160,31 +175,29 @@ static void __del_timeout_file(const std::string& _log_path) {
             }
         }
     }
+
+    TRACE_INFO("%s", "end");
 }
 
 static bool __append_file(const std::string& _src_file, const std::string& _dst_file) {
+    TRACE_INFO("%s", "start");
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s [%s] [%s]", __func__, _src_file.c_str(), _dst_file.c_str());
     if (_src_file == _dst_file) {
         return false;
     }
-
     if (!boost::filesystem::exists(_src_file)) {
         return false;
     }
-    
     if (0 == boost::filesystem::file_size(_src_file)){
         return true;
     }
 
     FILE* src_file = fopen(_src_file.c_str(), "rb");
-
     if (NULL == src_file) {
         return false;
     }
 
     FILE* dest_file = fopen(_dst_file.c_str(), "ab");
-
     if (NULL == dest_file) {
         fclose(src_file);
         return false;
@@ -196,19 +209,24 @@ static bool __append_file(const std::string& _src_file, const std::string& _dst_
     fseek(src_file, 0, SEEK_SET);
 
     char buffer[4096] = {0};
-
     while (true) {
-        if (feof(src_file)) break;
+        if (feof(src_file)) {
+            break;
+        }
 
         size_t read_ret = fread(buffer, 1, sizeof(buffer), src_file);
+        if (read_ret == 0) {
+            break;
+        }
 
-        if (read_ret == 0)   break;
-
-        if (ferror(src_file)) break;
+        if (ferror(src_file)) {
+            break;
+        }
 
         fwrite(buffer, 1, read_ret, dest_file);
-
-        if (ferror(dest_file))  break;
+        if (ferror(dest_file))  {
+            break;
+        }
     }
 
     if (dst_file_len + src_file_len > ftell(dest_file)) {
@@ -221,120 +239,144 @@ static bool __append_file(const std::string& _src_file, const std::string& _dst_
     fclose(src_file);
     fclose(dest_file);
 
+    TRACE_INFO("%s", "end");
     return true;
 }
 
-/* TODO 确认规则 */
 static void __move_old_files(const std::string& _src_path, const std::string& _dest_path, const std::string& _nameprefix) {
+    TRACE_INFO("%s", "start");
+
     if (_src_path == _dest_path) {
         return;
     }
-
     boost::filesystem::path path(_src_path);
     if (!boost::filesystem::is_directory(path)) {
         return;
     }
-    
+
     ScopedLock lock_file(sg_mutex_log_file);
     time_t now_time = time(NULL);
-    
     boost::filesystem::directory_iterator end_iter;
     for (boost::filesystem::directory_iterator iter(path); iter != end_iter; ++iter) {
-        
-        if (!strutil::StartsWith(iter->path().filename().string(), _nameprefix) || !strutil::EndsWith(iter->path().string(), LOG_EXT)) {
+
+        /* 前缀和后缀(qlog)符合预期 */
+        if (!strutil::StartsWith(iter->path().filename().string(), _nameprefix) 
+                || !strutil::EndsWith(iter->path().string(), LOG_EXT)) {
             continue;
         }
-        
+
+        /* 缓存时间是否到期 */
         if (sg_cache_log_days > 0) {
             time_t file_modify_time = boost::filesystem::last_write_time(iter->path());
             if (now_time > file_modify_time && (now_time - file_modify_time) < sg_cache_log_days * 24 * 60 * 60) {
                 continue;
             }
         }
-        
+
+        /* 从 cache 移动至正式文件 */
         if (!__append_file(iter->path().string(), sg_logdir + "/" + iter->path().filename().string())) {
             break;
         }
-        
+
+        /* 删除 cache 文件 */
         boost::filesystem::remove(iter->path());
     }
+
+    TRACE_INFO("%s", "end");
 }
 
 static void __writetips2console(const char* _tips_format, ...) {
-    
+    TRACE_INFO("%s", "start");
+
     if (NULL == _tips_format) {
         return;
     }
-    
+
     XLoggerInfo info;
     memset(&info, 0, sizeof(XLoggerInfo));
-    
+
     char tips_info[4096] = {0};
     va_list ap;
     va_start(ap, _tips_format);
     vsnprintf(tips_info, sizeof(tips_info), _tips_format, ap);
     va_end(ap);
+
     ConsoleLog(&info, tips_info);
+
+    TRACE_INFO("%s", "end");
 }
 
 static void __async_log_thread() {
+    TRACE_INFO("%s", "start");
+
     while (true) {
 
         ScopedLock lock_buff(sg_key_logappender_map[1]->m_mutex_buffer_async);
-
-        if (NULL == sg_key_logappender_map[1]->m_log_buff) break;
-
+        if (NULL == sg_key_logappender_map[1]->m_log_buff) {
+            break;
+        }
         AutoBuffer tmp_buff;
         sg_key_logappender_map[1]->m_log_buff->Flush(tmp_buff);
         lock_buff.unlock();
 
-        if (NULL != tmp_buff.Ptr())  sg_key_logappender_map[1]->log2file(tmp_buff.Ptr(), tmp_buff.Length(), true);
+        if (NULL != tmp_buff.Ptr()) {
+            sg_key_logappender_map[1]->log2file(tmp_buff.Ptr(), tmp_buff.Length(), true);
+        }
 
-        if (sg_key_logappender_map[1]->m_log_close) break;
+        if (sg_key_logappender_map[1]->m_log_close) {
+            break;
+        }
 
         sg_cond_buffer_async.wait(15 * 60 * 1000);
     }
+
+    TRACE_INFO("%s", "end");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////
 
 void xlogger_appender(const XLoggerInfo* _info, const char* _log) {
+    /* TODO 校验 */
     /* if (sg_log_close) return; */
+    /* TRACE_INFO("%s", "start"); */
 
     SCOPE_ERRNO();
-
     DEFINE_SCOPERECURSIONLIMIT(recursion);
     static Tss s_recursion_str(free);
 
-    if (sg_consolelog_open) ConsoleLog(_info,  _log);
+    if (sg_consolelog_open) {
+        ConsoleLog(_info,  _log);
+    }
 
     if (2 <= (int)recursion.Get() && NULL == s_recursion_str.get()) {
-        if ((int)recursion.Get() > 10) return;
+
+        /* 禁止递归调用，出现递归调用时打印错误信息 */
+        if ((int)recursion.Get() > 10) {
+            return;
+        }
         char* strrecursion = (char*)calloc(16 * 1024, 1);
         s_recursion_str.set((void*)(strrecursion));
-
         XLoggerInfo info = *_info;
         info.level = kLevelFatal;
-
         char recursive_log[256] = {0};
-        snprintf(recursive_log, sizeof(recursive_log), "ERROR!!! xlogger_appender Recursive calls!!!, count:%d", (int)recursion.Get());
-
+        snprintf(recursive_log, sizeof(recursive_log),
+                "ERROR!!! xlogger_appender Recursive calls!!!, count:%d", (int)recursion.Get());
         PtrBuffer tmp(strrecursion, 0, 16*1024);
         log_formater(&info, recursive_log, tmp);
-
         strncat(strrecursion, _log, 4096);
         strrecursion[4095] = '\0';
-
         ConsoleLog(&info,  strrecursion);
     } else {
+
+        /* 重置递归标记 */
         if (NULL != s_recursion_str.get()) {
             char* strrecursion = (char*)s_recursion_str.get();
             s_recursion_str.set(NULL);
-
             sg_key_logappender_map[1]->writetips2file(strrecursion);
             free(strrecursion);
         }
 
+        /* 写入日志 */
         if (kAppednerSync == sg_mode) {
             sg_key_logappender_map[1]->appender_sync(_info, _log);
         }
@@ -342,9 +384,13 @@ void xlogger_appender(const XLoggerInfo* _info, const char* _log) {
             sg_key_logappender_map[1]->appender_async(_info, _log);
         }
     }
+
+    /* TRACE_INFO("%s", "end"); */
 }
 
 static void get_mark_info(char* _info, size_t _infoLen) {
+    TRACE_INFO("%s", "start");
+
     struct timeval tv;
     gettimeofday(&tv, 0);
     time_t sec = tv.tv_sec;
@@ -352,12 +398,18 @@ static void get_mark_info(char* _info, size_t _infoLen) {
     char tmp_time[64] = {0};
     strftime(tmp_time, sizeof(tmp_time), "%Y-%m-%d %z %H:%M:%S", &tm_tmp);
     snprintf(_info, _infoLen, "[%" PRIdMAX ",%" PRIdMAX "][%s]", xlogger_pid(), xlogger_tid(), tmp_time);
+
+    TRACE_INFO("%s", "end");
+
 }
 
 void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefix, const char* _pub_key) {
+    TRACE_INFO("%s", "start");
+
     assert(_dir);
     assert(_nameprefix);
-    
+
+
     /* TODO 删除 */
     /* TODO 判断 m_log_close 是否为 true  */
     /* if (!sg_log_close) { */
@@ -370,12 +422,12 @@ void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefi
 
 
     xlogger_SetAppender(&xlogger_appender);
-    
+
     boost::filesystem::create_directories(_dir);
     tickcount_t tick;
     tick.gettickcount();
     Thread(boost::bind(&__del_timeout_file, _dir)).start_after(2 * 60 * 1000);
-    
+
     tick.gettickcount();
 
 #ifdef __APPLE__
@@ -400,7 +452,7 @@ void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefi
     /* sg_log_close = false; */
     appender_setmode(_mode);
     lock.unlock();
-    
+
     char mark_info[512] = {0};
     get_mark_info(mark_info, sizeof(mark_info));
 
@@ -430,23 +482,26 @@ void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefi
     /* TODO 需要打印是否使用 mmap */
     /* snprintf(logmsg, sizeof(logmsg), "log appender mode:%d, use mmap:%d", (int)_mode, use_mmap); */
     /* xlogger_appender(NULL, logmsg); */
-    
+
     if (!sg_cache_logdir.empty()) {
         boost::filesystem::space_info info = boost::filesystem::space(sg_cache_logdir);
         snprintf(logmsg, sizeof(logmsg), "cache dir space info, capacity:%" PRIuMAX" free:%" PRIuMAX" available:%" PRIuMAX, info.capacity, info.free, info.available);
         xlogger_appender(NULL, logmsg);
     }
-    
+
     boost::filesystem::space_info info = boost::filesystem::space(sg_logdir);
     snprintf(logmsg, sizeof(logmsg), "log dir space info, capacity:%" PRIuMAX" free:%" PRIuMAX" available:%" PRIuMAX, info.capacity, info.free, info.available);
     xlogger_appender(NULL, logmsg);
 
     BOOT_RUN_EXIT(appender_close);
 
+    TRACE_INFO("%s", "end");
 }
 
 void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir, const std::string& _logdir,
-                              const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info) {
+        const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info) {
+    TRACE_INFO("%s", "start");
+    
     assert(!_cachedir.empty());
     assert(!_logdir.empty());
     assert(_nameprefix);
@@ -469,19 +524,26 @@ void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir,
 #endif
     appender_open(_mode, _logdir.c_str(), _nameprefix, _pub_key);
 
+    TRACE_INFO("%s", "end");
 }
 
 void appender_flush() {
+    TRACE_INFO("%s", "start");
+
     sg_cond_buffer_async.notifyAll();
+
+    TRACE_INFO("%s", "end");
 }
 
 void appender_flush_sync() {
+    TRACE_INFO("%s", "start");
+
     if (kAppednerSync == sg_mode) {
         return;
     }
 
     ScopedLock lock_buff(sg_key_logappender_map[1]->m_mutex_buffer_async);
-    
+
     if (NULL == sg_key_logappender_map[1]->m_log_buff) return;
 
     AutoBuffer tmp_buff;
@@ -491,9 +553,12 @@ void appender_flush_sync() {
 
     if (tmp_buff.Ptr())  sg_key_logappender_map[1]->log2file(tmp_buff.Ptr(), tmp_buff.Length(), true);
 
+    TRACE_INFO("%s", "end");
 }
 
 void appender_close() {
+    TRACE_INFO("%s", "start");
+    TRACE_INFO("%s", "end");
     /* TODO 反初始化操作 */
     /* if (sg_log_close) return; */
 
@@ -510,7 +575,7 @@ void appender_close() {
     /* if (sg_thread_async.isruning()) */
     /*     sg_thread_async.join(); */
 
-    
+
     /* ScopedLock buffer_lock(sg_mutex_buffer_async); */
     /* if (sg_mmmap_file.is_open()) { */
     /*     if (!sg_mmmap_file.operator !()) memset(sg_mmmap_file.data(), 0, kBufferBlockLength); */
@@ -529,6 +594,8 @@ void appender_close() {
 }
 
 void appender_setmode(TAppenderMode _mode) {
+    TRACE_INFO("%s", "start");
+
     sg_mode = _mode;
 
     sg_cond_buffer_async.notifyAll();
@@ -536,42 +603,69 @@ void appender_setmode(TAppenderMode _mode) {
     if (kAppednerAsync == sg_mode && !sg_thread_async.isruning()) {
         sg_thread_async.start();
     }
+
+    TRACE_INFO("%s", "end");
 }
 
 bool appender_get_current_log_path(char* _log_path, unsigned int _len) {
-    if (NULL == _log_path || 0 == _len) return false;
+    TRACE_INFO("%s", "start");
 
-    if (sg_logdir.empty())  return false;
-
+    if (NULL == _log_path || 0 == _len) {
+        return false;
+    }
+    if (sg_logdir.empty()) {
+        return false;
+    }
     strncpy(_log_path, sg_logdir.c_str(), _len - 1);
     _log_path[_len - 1] = '\0';
+
+    TRACE_INFO("%s", "end");
     return true;
 }
 
 bool appender_get_current_log_cache_path(char* _logPath, unsigned int _len) {
-    if (NULL == _logPath || 0 == _len) return false;
-    
-    if (sg_cache_logdir.empty())  return false;
+    TRACE_INFO("%s", "start");
+
+    if (NULL == _logPath || 0 == _len) {
+        return false;
+    }
+    if (sg_cache_logdir.empty()) {
+        return false;
+    }
     strncpy(_logPath, sg_cache_logdir.c_str(), _len - 1);
     _logPath[_len - 1] = '\0';
+
+    TRACE_INFO("%s", "end");
     return true;
 }
 
 void appender_set_console_log(bool _is_open) {
+    TRACE_INFO("%s", "start");
+
     sg_consolelog_open = _is_open;
+
+    TRACE_INFO("%s", "end");
 }
 
 void appender_set_max_file_size(uint64_t _max_byte_size) {
+    TRACE_INFO("%s", "start");
+
     sg_max_file_size = _max_byte_size;
+
+    TRACE_INFO("%s", "end");
 }
 void appender_set_max_alive_duration(long _max_time) {
-	if (_max_time >= kMinLogAliveTime) {
-		sg_max_alive_time = _max_time;
-	}
+    TRACE_INFO("%s", "start");
+
+    if (_max_time >= kMinLogAliveTime) {
+        sg_max_alive_time = _max_time;
+    }
+
+    TRACE_INFO("%s", "end");
 }
 
 LogAppender::LogAppender(int key) {
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     m_key = key;
     m_mmmap_file = new boost::iostreams::mapped_file;
@@ -588,20 +682,19 @@ LogAppender::LogAppender(int key) {
     m_last_tick = 0;
     memset(m_last_file_path, 0, sizeof(m_last_file_path));
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
 }
 
 LogAppender::~LogAppender() {
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     delete m_mmmap_file;
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
 }
 
 bool LogAppender::init_buff(const char* _dir, const char* _nameprefix, const char* _pub_key) {
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     char mmap_file_path[512] = {0};
     snprintf(mmap_file_path, sizeof(mmap_file_path), "%s/%s.mmap%d",
@@ -623,13 +716,12 @@ bool LogAppender::init_buff(const char* _dir, const char* _nameprefix, const cha
         return false;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
-
+    TRACE_INFO("%s", "end");
     return true;
 }
 
 bool LogAppender::deinit_buff() {
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     if (NULL != m_log_buff) {
         delete m_log_buff;
@@ -643,12 +735,12 @@ bool LogAppender::deinit_buff() {
         CloseMmapFile(*m_mmmap_file);
     }
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
     return true;
 }
 
 void LogAppender::appender_sync(const XLoggerInfo* _info, const char* _log) {
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     char temp[16 * 1024] = {0};     // tell perry,ray if you want modify size.
     PtrBuffer log(temp, 0, sizeof(temp));
@@ -659,10 +751,11 @@ void LogAppender::appender_sync(const XLoggerInfo* _info, const char* _log) {
 
     log2file(tmp_buff.Ptr(), tmp_buff.Length(), false);
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
 }
 
 void LogAppender::appender_async(const XLoggerInfo* _info, const char* _log) {
+    /* TRACE_INFO("%s", "start"); */
 
     ScopedLock lock(m_mutex_buffer_async);
     if (NULL == m_log_buff) {
@@ -674,8 +767,8 @@ void LogAppender::appender_async(const XLoggerInfo* _info, const char* _log) {
     log_formater(_info, _log, log_buff);
 
     if (m_log_buff->GetData().Length() >= kBufferBlockLength*4/5) {
-       int ret = snprintf(temp, sizeof(temp), "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: %d\n", (int)m_log_buff->GetData().Length());
-       log_buff.Length(ret, ret);
+        int ret = snprintf(temp, sizeof(temp), "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: %d\n", (int)m_log_buff->GetData().Length());
+        log_buff.Length(ret, ret);
     }
 
     if (!m_log_buff->Write(log_buff.Ptr(), (unsigned int)log_buff.Length())) {
@@ -683,17 +776,19 @@ void LogAppender::appender_async(const XLoggerInfo* _info, const char* _log) {
     }
 
     if (m_log_buff->GetData().Length() >= kBufferBlockLength*1/3 || (NULL!=_info && kLevelFatal == _info->level)) {
-       sg_cond_buffer_async.notifyAll();
+        sg_cond_buffer_async.notifyAll();
     }
+
+    /* TRACE_INFO("%s", "end"); */
 }
 
 void LogAppender::writetips2file(const char* _tips_format, ...) {
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     if (NULL == _tips_format) {
         return;
     }
-    
+
     char tips_info[4096] = {0};
     va_list ap;
     va_start(ap, _tips_format);
@@ -702,15 +797,14 @@ void LogAppender::writetips2file(const char* _tips_format, ...) {
 
     AutoBuffer tmp_buff;
     m_log_buff->Write(tips_info, strnlen(tips_info, sizeof(tips_info)), tmp_buff);
-    
+
     log2file(tmp_buff.Ptr(), tmp_buff.Length(), false);
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
 }
 
 void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     if (NULL == _data || 0 == _len || sg_logdir.empty()) {
         return;
@@ -728,19 +822,18 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
         return;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s 2", __func__);
     struct timeval tv;
     gettimeofday(&tv, NULL);
     char logcachefilepath[1024] = {0};
     __make_logfilename(tv, sg_cache_logdir, sg_logfileprefix.c_str(), LOG_EXT, logcachefilepath , 1024);
-    
+
     bool cache_logs = __cache_logs();
     if ((cache_logs || boost::filesystem::exists(logcachefilepath)) && __openlogfile(sg_cache_logdir)) {
         __writefile(_data, _len, m_logfile);
         if (kAppednerAsync == sg_mode) {
             __closelogfile();
         }
-        
+
         if (cache_logs || !_move_file) {
             return;
         }
@@ -755,8 +848,7 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
         }
         return;
     }
-    
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s 3", __func__);
+
     bool write_sucess = false;
     bool open_success = __openlogfile(sg_logdir);
     if (open_success) {
@@ -765,8 +857,6 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
             __closelogfile();
         }
     }
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s 4", __func__);
 
     if (!write_sucess) {
         if (open_success && kAppednerSync == sg_mode) {
@@ -781,11 +871,11 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
         }
     }
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
 }
 
 void LogAppender::__closelogfile() {
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     if (NULL == m_logfile) return;
 
@@ -793,11 +883,11 @@ void LogAppender::__closelogfile() {
     fclose(m_logfile);
     m_logfile = NULL;
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
 }
 
 bool LogAppender::__openlogfile(const std::string& _log_dir) {
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin[%s]", __func__, _log_dir.c_str());
+    TRACE_INFO("%s", "start");
 
     if (sg_logdir.empty()) return false;
 
@@ -881,70 +971,65 @@ bool LogAppender::__openlogfile(const std::string& _log_dir) {
     assert(m_logfile);
 #endif
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
-
+    TRACE_INFO("%s", "end");
     return NULL != m_logfile;
 }
 
 void LogAppender::__make_logfilename(const timeval& _tv, const std::string& _logdir,
         const char* _prefix, const std::string& _fileext, char* _filepath, unsigned int _len) {
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     long index_ = 0;
     std::string logfilenameprefix = __make_logfilenameprefix(_tv, _prefix);
     if (sg_max_file_size > 0) {
         index_ = __get_next_fileindex(logfilenameprefix, _fileext);
     }
-    
+
     std::string logfilepath = _logdir;
     logfilepath += "/";
     logfilepath += logfilenameprefix;
-    
+
     if (index_ > 0) {
         char temp[24] = {0};
         snprintf(temp, 24, "_%ld", index_);
         logfilepath += temp;
     }
-    
+
     logfilepath += ".";
     logfilepath += _fileext;
-    
+
     strncpy(_filepath, logfilepath.c_str(), _len - 1);
     _filepath[_len - 1] = '\0';
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
 }
 
 std::string LogAppender::__make_logfilenameprefix(const timeval& _tv, const char* _prefix) {
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     time_t sec = _tv.tv_sec;
     tm tcur = *localtime((const time_t*)&sec);
-    
+
     char temp [64] = {0};
     snprintf(temp, 64, "_%d%02d%02d%02d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon,
             tcur.tm_mday, tcur.tm_hour, 0, m_key);//配合logsdk按照小时分割日志，分和秒变为0
 
     std::string filenameprefix = _prefix;
     filenameprefix += temp;
-    
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
 
+    TRACE_INFO("%s", "end");
     return filenameprefix;
 }
 
 long LogAppender::__get_next_fileindex(const std::string& _fileprefix, const std::string& _fileext) {
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     std::vector<std::string> filename_vec;
     __get_filenames_by_prefix(sg_logdir, _fileprefix, _fileext, filename_vec);
     if (!sg_cache_logdir.empty()) {
         __get_filenames_by_prefix(sg_cache_logdir, _fileprefix, _fileext, filename_vec);
     }
-    
+
     long index = 0; // long is enought to hold all indexes in one day.
     if (filename_vec.empty()) {
         return index;
@@ -961,7 +1046,7 @@ long LogAppender::__get_next_fileindex(const std::string& _fileprefix, const std
         }
         index = atol(index_str.c_str());
     }
-    
+
     uint64_t filesize = 0;
     std::string logfilepath = sg_logdir + "/" + last_filename;
     if (boost::filesystem::exists(logfilepath)) {
@@ -973,24 +1058,23 @@ long LogAppender::__get_next_fileindex(const std::string& _fileprefix, const std
             filesize += boost::filesystem::file_size(logfilepath);
         }
     }
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
 
+    TRACE_INFO("%s", "end");
     return (filesize > sg_max_file_size) ? index + 1 : index;
 }
 
 void LogAppender::__get_filenames_by_prefix(const std::string& _logdir, const std::string& _fileprefix,
         const std::string& _fileext, std::vector<std::string>& _filename_vec) {
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     boost::filesystem::path path(_logdir);
     if (!boost::filesystem::is_directory(path)) {
         return;
     }
-    
+
     boost::filesystem::directory_iterator end_iter;
     std::string filename;
-    
+
     for (boost::filesystem::directory_iterator iter(path); iter != end_iter; ++iter) {
         if (boost::filesystem::is_regular_file(iter->status())) {
             filename = iter->path().filename().string();
@@ -1000,18 +1084,17 @@ void LogAppender::__get_filenames_by_prefix(const std::string& _logdir, const st
         }
     }
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+    TRACE_INFO("%s", "end");
 }
 
 bool LogAppender::__cache_logs() {
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     if (sg_cache_logdir.empty() || sg_cache_log_days <= 0) {
-        __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
+        TRACE_INFO("%s", "end");
         return false;
     }
-    
+
     struct timeval tv;
     gettimeofday(&tv, NULL);
     char logfilepath[1024] = {0};
@@ -1019,19 +1102,19 @@ bool LogAppender::__cache_logs() {
     if (boost::filesystem::exists(logfilepath)) {
         return false;
     }
-    
+
     static const uintmax_t kAvailableSizeThreshold = (uintmax_t)1 * 1024 * 1024 * 1024;   // 1G
     boost::filesystem::space_info info = boost::filesystem::space(sg_cache_logdir);
     if (info.available < kAvailableSizeThreshold) {
         return false;
     }
-    
+
+    TRACE_INFO("%s", "end");
     return true;
 }
 
 bool LogAppender::__writefile(const void* _data, size_t _len, FILE* _file) {
-
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s begin", __func__);
+    TRACE_INFO("%s", "start");
 
     if (NULL == _file) {
         assert(false);
@@ -1060,7 +1143,6 @@ bool LogAppender::__writefile(const void* _data, size_t _len, FILE* _file) {
         return false;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, "jiexiao", "%s end", __func__);
-
+    TRACE_INFO("%s", "end");
     return true;
 }
