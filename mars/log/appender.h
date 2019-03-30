@@ -86,9 +86,9 @@ class LogAppender {
         bool init_buff(const char* _dir, const char* _nameprefix, const char* _pub_key);
         bool deinit_buff();
 
-        LogBuffer *m_log_buff;
-        bool m_log_close;
-        Mutex m_mutex_buffer_async;
+        LogBuffer *m_log_buff;                        // 日志先写入 LogBuffer, 满足一定条件才写入文件
+        Mutex m_mutex_buffer_async;                   // buffer 锁
+        bool m_use_mmap;                              // 是否使用 mmap
 
     private:
 
@@ -105,24 +105,22 @@ class LogAppender {
         bool __cache_logs();
 
         bool __writefile(const void* _data, size_t _len, FILE* _file);
+        void __writetips2console(const char* _tips_format, ...);
 
     private:
 
-        int m_key;
+        int m_key;                                    // 表示写入日志文件的 ID
 
-        boost::iostreams::mapped_file *m_mmmap_file;
+        FILE *m_logfile;                              // 日志文件描述符
+        time_t m_openfiletime;                        // 日志文件的打开时间
+        std::string m_current_dir;                    // 日志文件存放目录
 
-        FILE *m_logfile;
-        time_t m_openfiletime;
-        std::string m_current_dir;
+        time_t m_last_time;                           // 上次打开文件的时间
+        uint64_t m_last_tick;                         // 上次打开文件的 tick, 没搞懂作用
+        char m_last_file_path[1024];                  // 上次打开文件的路径
 
-        char* m_buffer;
-
-        time_t m_last_time;
-        uint64_t m_last_tick;
-        char m_last_file_path[1024];
-
-        bool m_use_mmap;
+        boost::iostreams::mapped_file *m_mmmap_file;  // 使用 mmap 时，日志的存储空间
+        char* m_buffer;                               // 不使用 mmap 时, 日志的存储空间
 };
 
 #endif /* APPENDER_H_ */

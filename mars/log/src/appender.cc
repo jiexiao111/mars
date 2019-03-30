@@ -65,7 +65,6 @@
 #include "mars/comm/objc/data_protect_attr.h"
 #endif
 
-
 #define LOG_EXT "qlog"
 
 extern void log_formater(const XLoggerInfo* _info, const char* _logbody, PtrBuffer& _log);
@@ -77,8 +76,12 @@ static std::string sg_logdir;
 static std::string sg_log_head_info;//cirodeng-20180524:add log head info param
 static std::string sg_cache_logdir;
 static std::string sg_logfileprefix;
+static std::string sg_pub_key;
+static bool sg_key_logappender_map_destroy = true;
 
-static Mutex sg_mutex_log_file;
+/* 同步写入只会应用于调试阶段, 异步写入只有一个线程负责写入文件, 所以全局文件锁不会产生性能问题 */
+static Mutex sg_mutex_log_file; 
+static Mutex sg_mutex_key_logappender_map;                   
 
 #ifdef _WIN32
 static Condition& sg_cond_buffer_async = *(new Condition());  // 改成引用, 避免在全局释放时执行析构导致crash
@@ -96,6 +99,7 @@ static uint64_t sg_max_file_size = 0; // 0, will not split log file.
 static int sg_cache_log_days = 0;   // 0, will not cache logs
 
 static void __async_log_thread();
+static LogAppender* __log_appender_factory(int key);
 static Thread sg_thread_async(&__async_log_thread);
 
 static const unsigned int kBufferBlockLength = 150 * 1024;
@@ -125,6 +129,8 @@ namespace {
 #define SCOPE_ERRNO_I(line) SCOPE_ERRNO_II(line)
 #define SCOPE_ERRNO_II(line) ScopeErrno __scope_errno_##line
 }
+
+#define DEFAULT_KEY 0
 
 /* 调试日志 */
 #define TRACE_CALL
@@ -183,67 +189,69 @@ static bool __append_file(const std::string& _src_file, const std::string& _dst_
     TRACE_INFO("%s", "start");
 
     if (_src_file == _dst_file) {
+        TRACE_INFO("%s", "end");
         return false;
     }
     if (!boost::filesystem::exists(_src_file)) {
+        TRACE_INFO("%s", "end");
         return false;
     }
     if (0 == boost::filesystem::file_size(_src_file)){
+        TRACE_INFO("%s", "end");
         return true;
     }
 
+    /* 将 src 的信息写入 dst */
     FILE* src_file = fopen(_src_file.c_str(), "rb");
     if (NULL == src_file) {
+        TRACE_INFO("%s", "end");
         return false;
     }
-
     FILE* dest_file = fopen(_dst_file.c_str(), "ab");
     if (NULL == dest_file) {
         fclose(src_file);
+        TRACE_INFO("%s", "end");
         return false;
     }
-
     fseek(src_file, 0, SEEK_END);
     long src_file_len = ftell(src_file);
     long dst_file_len = ftell(dest_file);
     fseek(src_file, 0, SEEK_SET);
-
     char buffer[4096] = {0};
     while (true) {
         if (feof(src_file)) {
             break;
         }
-
         size_t read_ret = fread(buffer, 1, sizeof(buffer), src_file);
         if (read_ret == 0) {
             break;
         }
-
         if (ferror(src_file)) {
             break;
         }
-
         fwrite(buffer, 1, read_ret, dest_file);
         if (ferror(dest_file))  {
             break;
         }
     }
 
+    /* 如果 dst 的大小大于 src + dst(写入前), 则放弃本次修改 */
     if (dst_file_len + src_file_len > ftell(dest_file)) {
         ftruncate(fileno(dest_file), dst_file_len);
         fclose(src_file);
         fclose(dest_file);
+        TRACE_INFO("%s", "end");
         return false;
     }
 
     fclose(src_file);
     fclose(dest_file);
-
     TRACE_INFO("%s", "end");
     return true;
 }
 
-static void __move_old_files(const std::string& _src_path, const std::string& _dest_path, const std::string& _nameprefix) {
+static void __move_old_files(const std::string& _src_path,
+        const std::string& _dest_path, const std::string& _nameprefix) {
     TRACE_INFO("%s", "start");
 
     if (_src_path == _dest_path) {
@@ -285,73 +293,79 @@ static void __move_old_files(const std::string& _src_path, const std::string& _d
     TRACE_INFO("%s", "end");
 }
 
-static void __writetips2console(const char* _tips_format, ...) {
+static bool __logs2file() {
     TRACE_INFO("%s", "start");
 
-    if (NULL == _tips_format) {
-        return;
+    bool ret = true;
+    TKey_Logappender_Map::iterator iter;
+    LogAppender *logappender;
+    for (iter = sg_key_logappender_map.begin(); iter != sg_key_logappender_map.end(); iter++) {
+
+        /* 将 buf 中的数据压缩加密 */
+        logappender = iter->second;
+        ScopedLock lock_buff(logappender->m_mutex_buffer_async);
+        if (NULL == logappender->m_log_buff) {
+            ret = false;
+            lock_buff.unlock();
+            continue;
+        }
+        AutoBuffer tmp_buff;
+        logappender->m_log_buff->Flush(tmp_buff);
+        lock_buff.unlock();
+
+        /* 将 buff 中的数据写入文件 */
+        if (NULL != tmp_buff.Ptr()) {
+            logappender->log2file(tmp_buff.Ptr(), tmp_buff.Length(), true);
+        }
+        if (sg_key_logappender_map_destroy) {
+            ret = false;
+            continue;
+        }
     }
 
-    XLoggerInfo info;
-    memset(&info, 0, sizeof(XLoggerInfo));
-
-    char tips_info[4096] = {0};
-    va_list ap;
-    va_start(ap, _tips_format);
-    vsnprintf(tips_info, sizeof(tips_info), _tips_format, ap);
-    va_end(ap);
-
-    ConsoleLog(&info, tips_info);
-
     TRACE_INFO("%s", "end");
+    return ret;
 }
 
 static void __async_log_thread() {
     TRACE_INFO("%s", "start");
 
     while (true) {
-
-        ScopedLock lock_buff(sg_key_logappender_map[1]->m_mutex_buffer_async);
-        if (NULL == sg_key_logappender_map[1]->m_log_buff) {
+        /* 如果出现错误则停止线程 */
+        if (!__logs2file()) {
             break;
         }
-        AutoBuffer tmp_buff;
-        sg_key_logappender_map[1]->m_log_buff->Flush(tmp_buff);
-        lock_buff.unlock();
-
-        if (NULL != tmp_buff.Ptr()) {
-            sg_key_logappender_map[1]->log2file(tmp_buff.Ptr(), tmp_buff.Length(), true);
-        }
-
-        if (sg_key_logappender_map[1]->m_log_close) {
-            break;
-        }
-
         sg_cond_buffer_async.wait(15 * 60 * 1000);
     }
 
     TRACE_INFO("%s", "end");
 }
 
-////////////////////////////////////////////////////////////////////////////////////
-
 void xlogger_appender(const XLoggerInfo* _info, const char* _log) {
-    /* TODO 校验 */
-    /* if (sg_log_close) return; */
-    /* TRACE_INFO("%s", "start"); */
+    TRACE_INFO("%s", "start");
 
-    SCOPE_ERRNO();
-    DEFINE_SCOPERECURSIONLIMIT(recursion);
-    static Tss s_recursion_str(free);
+    /* 根据 level 获取对应的 LogAppender */
+    int log_file_key = (NULL == _info) ? DEFAULT_KEY : _info->level;
+    LogAppender *logappender;
+    logappender = __log_appender_factory(log_file_key);
+    if (NULL == logappender) { 
+        TRACE_INFO("%s", "end");
+        return;
+    }
 
+    /* 调试模式将日志打印至 console */
     if (sg_consolelog_open) {
         ConsoleLog(_info,  _log);
     }
 
+    SCOPE_ERRNO();
+    DEFINE_SCOPERECURSIONLIMIT(recursion);
+    static Tss s_recursion_str(free);
     if (2 <= (int)recursion.Get() && NULL == s_recursion_str.get()) {
 
         /* 禁止递归调用，出现递归调用时打印错误信息 */
         if ((int)recursion.Get() > 10) {
+            TRACE_INFO("%s", "error");
             return;
         }
         char* strrecursion = (char*)calloc(16 * 1024, 1);
@@ -372,20 +386,20 @@ void xlogger_appender(const XLoggerInfo* _info, const char* _log) {
         if (NULL != s_recursion_str.get()) {
             char* strrecursion = (char*)s_recursion_str.get();
             s_recursion_str.set(NULL);
-            sg_key_logappender_map[1]->writetips2file(strrecursion);
+            logappender->writetips2file(strrecursion);
             free(strrecursion);
         }
 
         /* 写入日志 */
         if (kAppednerSync == sg_mode) {
-            sg_key_logappender_map[1]->appender_sync(_info, _log);
+            logappender->appender_sync(_info, _log);
         }
         else {
-            sg_key_logappender_map[1]->appender_async(_info, _log);
+            logappender->appender_async(_info, _log);
         }
     }
 
-    /* TRACE_INFO("%s", "end"); */
+    TRACE_INFO("%s", "end");
 }
 
 static void get_mark_info(char* _info, size_t _infoLen) {
@@ -400,102 +414,64 @@ static void get_mark_info(char* _info, size_t _infoLen) {
     snprintf(_info, _infoLen, "[%" PRIdMAX ",%" PRIdMAX "][%s]", xlogger_pid(), xlogger_tid(), tmp_time);
 
     TRACE_INFO("%s", "end");
-
 }
 
 void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefix, const char* _pub_key) {
     TRACE_INFO("%s", "start");
 
+    /* 准备目录 */
     assert(_dir);
     assert(_nameprefix);
-
-
-    /* TODO 删除 */
-    /* TODO 判断 m_log_close 是否为 true  */
-    /* if (!sg_log_close) { */
-    /*     __writetips2file("appender has already been opened. _dir:%s _nameprefix:%s", _dir, _nameprefix); */
-    /*     return; */
-    /* } */
-
-    /* TODO 判断 key 是否存在于 map, 如果存在不再创建对象 */
-    sg_key_logappender_map.insert(TKey_Logappender_Pair(1, new LogAppender(1)));
-
-
-    xlogger_SetAppender(&xlogger_appender);
-
-    boost::filesystem::create_directories(_dir);
     tickcount_t tick;
     tick.gettickcount();
+    boost::filesystem::create_directories(_dir);
     Thread(boost::bind(&__del_timeout_file, _dir)).start_after(2 * 60 * 1000);
 
-    tick.gettickcount();
+    /* 初始化全局变量 */
+    ScopedLock lock(sg_mutex_key_logappender_map);
+    sg_logdir = _dir;
+    sg_logfileprefix = _nameprefix;
+    sg_pub_key = _pub_key;
+    sg_key_logappender_map_destroy = false;
+    appender_setmode(_mode);
+    lock.unlock();
+
+    /* 创建默认 LogAppender, 并注册打印日志接口 */
+    xlogger_SetAppender(&xlogger_appender);
 
 #ifdef __APPLE__
     setAttrProtectionNone(_dir);
 #endif
 
-    /* TODO 循环初始化 buf */
-    sg_key_logappender_map[1]->init_buff(_dir, _nameprefix, _pub_key);
-
-    /* AutoBuffer buffer; */
-    /* sg_log_buff->Flush(buffer); */
-
-    /* TODO 循环 flush buf */
-    AutoBuffer tmp_buffer;
-    sg_key_logappender_map[1]->m_log_buff->Flush(tmp_buffer);
-
-    ScopedLock lock(sg_mutex_log_file);
-    sg_logdir = _dir;
-    sg_logfileprefix = _nameprefix;
-    /* TODO 多个变量均需初始化 */
-    sg_key_logappender_map[1]->m_log_close = false;
-    /* sg_log_close = false; */
-    appender_setmode(_mode);
-    lock.unlock();
-
-    char mark_info[512] = {0};
-    get_mark_info(mark_info, sizeof(mark_info));
-
-    /* TODO 循环写入调试信息 */
-    if (tmp_buffer.Ptr()) {
-        sg_key_logappender_map[1]->writetips2file("~~~~~ begin of mmap ~~~~~\n");
-        sg_key_logappender_map[1]->log2file(tmp_buffer.Ptr(), tmp_buffer.Length(), false);
-        sg_key_logappender_map[1]->writetips2file("~~~~~ end of mmap ~~~~~\n%s\n", mark_info);
-    }
-
+    /* 打印初始化时间 */
     tickcountdiff_t get_mmap_time = tickcount_t().gettickcount() - tick;
-
-    char appender_info[1028] = {0};
-    snprintf(appender_info, sizeof(appender_info), "^^^^^^^^^^" __DATE__ "^^^" __TIME__ "^^^^^^^^^^\n%s", mark_info);
-    xlogger_appender(NULL, appender_info);
-
     char logmsg[256] = {0};
     snprintf(logmsg, sizeof(logmsg), "get mmap time: %" PRIu64, (int64_t)get_mmap_time);
     xlogger_appender(NULL, logmsg);
 
+    /* 打印编译信息 */
     xlogger_appender(NULL, "MARS_URL: " MARS_URL);
     xlogger_appender(NULL, "MARS_PATH: " MARS_PATH);
     xlogger_appender(NULL, "MARS_REVISION: " MARS_REVISION);
     xlogger_appender(NULL, "MARS_BUILD_TIME: " MARS_BUILD_TIME);
     xlogger_appender(NULL, "MARS_BUILD_JOB: " MARS_TAG);
 
-    /* TODO 需要打印是否使用 mmap */
-    /* snprintf(logmsg, sizeof(logmsg), "log appender mode:%d, use mmap:%d", (int)_mode, use_mmap); */
-    /* xlogger_appender(NULL, logmsg); */
-
+    /* 打印 cache 目录的容量信息 */
     if (!sg_cache_logdir.empty()) {
         boost::filesystem::space_info info = boost::filesystem::space(sg_cache_logdir);
-        snprintf(logmsg, sizeof(logmsg), "cache dir space info, capacity:%" PRIuMAX" free:%" PRIuMAX" available:%" PRIuMAX, info.capacity, info.free, info.available);
+        snprintf(logmsg, sizeof(logmsg), "cache dir space info, capacity:%" PRIuMAX" free:%" PRIuMAX" available:%" PRIuMAX,
+                info.capacity, info.free, info.available);
         xlogger_appender(NULL, logmsg);
     }
 
+    /* 打印日志目录的容量信息 */
     boost::filesystem::space_info info = boost::filesystem::space(sg_logdir);
-    snprintf(logmsg, sizeof(logmsg), "log dir space info, capacity:%" PRIuMAX" free:%" PRIuMAX" available:%" PRIuMAX, info.capacity, info.free, info.available);
+    snprintf(logmsg, sizeof(logmsg), "log dir space info, capacity:%" PRIuMAX" free:%" PRIuMAX" available:%" PRIuMAX,
+            info.capacity, info.free, info.available);
     xlogger_appender(NULL, logmsg);
 
-    BOOT_RUN_EXIT(appender_close);
-
     TRACE_INFO("%s", "end");
+    BOOT_RUN_EXIT(appender_close);
 }
 
 void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir, const std::string& _logdir,
@@ -510,12 +486,13 @@ void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir,
     sg_log_head_info = _log_head_info;//cirodeng-20180524:add log head info param
     sg_cache_log_days = _cache_days;
 
+    /* 定时将 cache 文件移动到正式目录 */
     if (!_cachedir.empty()) {
         sg_cache_logdir = _cachedir;
         boost::filesystem::create_directories(_cachedir);
-
         Thread(boost::bind(&__del_timeout_file, _cachedir)).start_after(2 * 60 * 1000);
-        // "_nameprefix" must explicitly convert to "std::string", or when the thread is ready to run, "_nameprefix" has been released.
+        // "_nameprefix" must explicitly convert to "std::string", or when the thread
+        // is ready to run, "_nameprefix" has been released.
         Thread(boost::bind(&__move_old_files, _cachedir, _logdir, std::string(_nameprefix))).start_after(3 * 60 * 1000);
     }
 
@@ -541,56 +518,29 @@ void appender_flush_sync() {
     if (kAppednerSync == sg_mode) {
         return;
     }
-
-    ScopedLock lock_buff(sg_key_logappender_map[1]->m_mutex_buffer_async);
-
-    if (NULL == sg_key_logappender_map[1]->m_log_buff) return;
-
-    AutoBuffer tmp_buff;
-    sg_key_logappender_map[1]->m_log_buff->Flush(tmp_buff);
-
-    lock_buff.unlock();
-
-    if (tmp_buff.Ptr())  sg_key_logappender_map[1]->log2file(tmp_buff.Ptr(), tmp_buff.Length(), true);
+    __logs2file();
 
     TRACE_INFO("%s", "end");
 }
 
 void appender_close() {
     TRACE_INFO("%s", "start");
+
+    /* 将 buff 中的日志写入文件 */
+    sg_cond_buffer_async.notifyAll();
+    if (sg_thread_async.isruning())
+        sg_thread_async.join();
+
+    /* 执行 deinit_buff, 释放 LogAppender 对象 */
+    ScopedLock lock(sg_mutex_key_logappender_map);
+    TKey_Logappender_Map::iterator iter;
+    for (iter = sg_key_logappender_map.begin(); iter != sg_key_logappender_map.end(); iter++) {
+        iter->second->deinit_buff();
+        delete iter->second;
+    }
+    sg_key_logappender_map_destroy = true;
+
     TRACE_INFO("%s", "end");
-    /* TODO 反初始化操作 */
-    /* if (sg_log_close) return; */
-
-    /* char mark_info[512] = {0}; */
-    /* get_mark_info(mark_info, sizeof(mark_info)); */
-    /* char appender_info[728] = {0}; */
-    /* snprintf(appender_info, sizeof(appender_info), "$$$$$$$$$$" __DATE__ "$$$" __TIME__ "$$$$$$$$$$%s\n", mark_info); */
-    /* xlogger_appender(NULL, appender_info); */
-
-    /* sg_log_close = true; */
-
-    /* sg_cond_buffer_async.notifyAll(); */
-
-    /* if (sg_thread_async.isruning()) */
-    /*     sg_thread_async.join(); */
-
-
-    /* ScopedLock buffer_lock(sg_mutex_buffer_async); */
-    /* if (sg_mmmap_file.is_open()) { */
-    /*     if (!sg_mmmap_file.operator !()) memset(sg_mmmap_file.data(), 0, kBufferBlockLength); */
-
-    /*     CloseMmapFile(sg_mmmap_file); */
-    /* } else { */
-    /*     delete[] (char*)((sg_log_buff->GetData()).Ptr()); */
-    /* } */
-
-    /* delete sg_log_buff; */
-    /* sg_log_buff = NULL; */
-    /* buffer_lock.unlock(); */
-
-    /* ScopedLock lock(sg_mutex_log_file); */
-    /* __closelogfile(); */
 }
 
 void appender_setmode(TAppenderMode _mode) {
@@ -654,6 +604,7 @@ void appender_set_max_file_size(uint64_t _max_byte_size) {
 
     TRACE_INFO("%s", "end");
 }
+
 void appender_set_max_alive_duration(long _max_time) {
     TRACE_INFO("%s", "start");
 
@@ -672,7 +623,7 @@ LogAppender::LogAppender(int key) {
 
     m_log_buff = NULL;
     m_logfile = NULL;
-    m_log_close = true;
+
     m_buffer = NULL;
     m_openfiletime = 0;
 
@@ -688,7 +639,13 @@ LogAppender::LogAppender(int key) {
 LogAppender::~LogAppender() {
     TRACE_INFO("%s", "start");
 
-    delete m_mmmap_file;
+    if (NULL != m_mmmap_file) {
+        delete m_mmmap_file;
+        m_mmmap_file = NULL;
+    }
+
+    /* 执行 __closelogfile */
+    __closelogfile();
 
     TRACE_INFO("%s", "end");
 }
@@ -698,8 +655,10 @@ bool LogAppender::init_buff(const char* _dir, const char* _nameprefix, const cha
 
     char mmap_file_path[512] = {0};
     snprintf(mmap_file_path, sizeof(mmap_file_path), "%s/%s.mmap%d",
-            sg_cache_logdir.empty()?_dir:sg_cache_logdir.c_str(), _nameprefix, m_key);
+            sg_cache_logdir.empty() ? _dir : sg_cache_logdir.c_str(), _nameprefix, m_key);
 
+    ScopedLock buffer_lock(m_mutex_buffer_async);
+    /* 创建 m_log_buff */
     if (NULL != m_mmmap_file && OpenMmapFile(mmap_file_path, kBufferBlockLength, *m_mmmap_file))  {
         m_log_buff = new LogBuffer(m_mmmap_file->data(), kBufferBlockLength, true, _pub_key);
         m_use_mmap = true;
@@ -709,6 +668,7 @@ bool LogAppender::init_buff(const char* _dir, const char* _nameprefix, const cha
         m_use_mmap = false;
     }
 
+    /* 异常处理 */
     if (NULL == m_log_buff->GetData().Ptr()) {
         if (m_use_mmap && NULL != m_mmmap_file && m_mmmap_file->is_open()) {
             CloseMmapFile(*m_mmmap_file);
@@ -723,15 +683,21 @@ bool LogAppender::init_buff(const char* _dir, const char* _nameprefix, const cha
 bool LogAppender::deinit_buff() {
     TRACE_INFO("%s", "start");
 
+    /* 释放 m_log_buff */
+    ScopedLock buffer_lock(m_mutex_buffer_async);
     if (NULL != m_log_buff) {
         delete m_log_buff;
+        m_log_buff = NULL;
     }
 
+    /* 释放 m_log_buff 内部资源 */
     if (NULL != m_buffer) {
         delete m_buffer;
     }
-
-    if (m_use_mmap && NULL != m_mmmap_file && m_mmmap_file->is_open()) {
+    if (NULL != m_mmmap_file && m_mmmap_file->is_open()) {
+        if (!m_mmmap_file->operator !()) {
+            memset(m_mmmap_file->data(), 0, kBufferBlockLength);
+        }
         CloseMmapFile(*m_mmmap_file);
     }
 
@@ -755,7 +721,7 @@ void LogAppender::appender_sync(const XLoggerInfo* _info, const char* _log) {
 }
 
 void LogAppender::appender_async(const XLoggerInfo* _info, const char* _log) {
-    /* TRACE_INFO("%s", "start"); */
+    TRACE_INFO("%s", "start");
 
     ScopedLock lock(m_mutex_buffer_async);
     if (NULL == m_log_buff) {
@@ -779,11 +745,11 @@ void LogAppender::appender_async(const XLoggerInfo* _info, const char* _log) {
         sg_cond_buffer_async.notifyAll();
     }
 
-    /* TRACE_INFO("%s", "end"); */
+    TRACE_INFO("%s", "end");
 }
 
 void LogAppender::writetips2file(const char* _tips_format, ...) {
-    TRACE_INFO("%s", "start");
+    TRACE_INFO("%s [%d]", "start", m_key);
 
     if (NULL == _tips_format) {
         return;
@@ -804,7 +770,7 @@ void LogAppender::writetips2file(const char* _tips_format, ...) {
 }
 
 void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
-    TRACE_INFO("%s", "start");
+    TRACE_INFO("%s [%d]", "start", m_key);
 
     if (NULL == _data || 0 == _len || sg_logdir.empty()) {
         return;
@@ -877,11 +843,12 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
 void LogAppender::__closelogfile() {
     TRACE_INFO("%s", "start");
 
-    if (NULL == m_logfile) return;
-
-    m_openfiletime = 0;
+    if (NULL == m_logfile) {
+        return;
+    }
     fclose(m_logfile);
     m_logfile = NULL;
+    m_openfiletime = 0;
 
     TRACE_INFO("%s", "end");
 }
@@ -889,16 +856,17 @@ void LogAppender::__closelogfile() {
 bool LogAppender::__openlogfile(const std::string& _log_dir) {
     TRACE_INFO("%s", "start");
 
-    if (sg_logdir.empty()) return false;
+    if (sg_logdir.empty()) {
+        return false;
+    }
 
+    /* 处理文件已经打开的情况 */
     struct timeval tv;
     gettimeofday(&tv, NULL);
-
     if (NULL != m_logfile) {
         time_t sec = tv.tv_sec;
         tm tcur = *localtime((const time_t*)&sec);
         tm filetm = *localtime(&m_openfiletime);
-
         if (filetm.tm_year == tcur.tm_year && filetm.tm_mon == tcur.tm_mon 
                 && filetm.tm_mday == tcur.tm_mday && m_current_dir == _log_dir) {
             return true;
@@ -908,34 +876,30 @@ bool LogAppender::__openlogfile(const std::string& _log_dir) {
         m_logfile = NULL;
     }
 
+    /* 打开日志文件 */
     uint64_t now_tick = gettickcount();
     time_t now_time = tv.tv_sec;
-
     m_openfiletime = tv.tv_sec;
     m_current_dir = _log_dir;
-
     char logfilepath[1024] = {0};
     __make_logfilename(tv, _log_dir, sg_logfileprefix.c_str(), LOG_EXT, logfilepath , 1024);
-
     if (now_time < m_last_time) {
         m_logfile = fopen(m_last_file_path, "ab");
 
         if (NULL == m_logfile) {
             __writetips2console("open file error:%d %s, path:%s", errno, strerror(errno), m_last_file_path);
         }
-
 #ifdef __APPLE__
         assert(m_logfile);
 #endif
         return NULL != m_logfile;
     }
-
     m_logfile = fopen(logfilepath, "ab");
-
     if (NULL == m_logfile) {
         __writetips2console("open file error:%d %s, path:%s", errno, strerror(errno), logfilepath);
     }
 
+    /* 写入设备信息 */
     if (0 == ftell(m_logfile)) {
         //cirodeng-20180524:add common info in the head of each logfile(not encrypted)
         char common_log[4096] = {0};
@@ -945,6 +909,7 @@ bool LogAppender::__openlogfile(const std::string& _log_dir) {
         __writefile(tmp_common_buff.Ptr(), tmp_common_buff.Length(), m_logfile);
     }
 
+    /* 没看懂, 好像是打印调试信息 */
     if (0 != m_last_time && (now_time - m_last_time) > (time_t)((now_tick - m_last_tick) / 1000 + 300)) {
 
         struct tm tm_tmp = *localtime((const time_t*)&m_last_time);
@@ -956,17 +921,16 @@ bool LogAppender::__openlogfile(const std::string& _log_dir) {
         strftime(now_time_str, sizeof(now_time_str), "%Y-%m-%d %z %H:%M:%S", &tm_tmp);
 
         char log[1024] = {0};
-        snprintf(log, sizeof(log), "[F][ last log file:%s from %s to %s, time_diff:%ld, tick_diff:%" PRIu64 "\n", m_last_file_path, last_time_str, now_time_str, now_time-m_last_time, now_tick-m_last_tick);
+        snprintf(log, sizeof(log), "[F][ last log file:%s from %s to %s, time_diff:%ld, tick_diff:%" PRIu64 "\n",
+                m_last_file_path, last_time_str, now_time_str, now_time-m_last_time, now_tick-m_last_tick);
 
         AutoBuffer tmp_buff;
         m_log_buff->Write(log, strnlen(log, sizeof(log)), tmp_buff);
         __writefile(tmp_buff.Ptr(), tmp_buff.Length(), m_logfile);
     }
-
     memcpy(m_last_file_path, logfilepath, sizeof(m_last_file_path));
     m_last_tick = now_tick;
     m_last_time = now_time;
-
 #ifdef __APPLE__
     assert(m_logfile);
 #endif
@@ -1114,7 +1078,7 @@ bool LogAppender::__cache_logs() {
 }
 
 bool LogAppender::__writefile(const void* _data, size_t _len, FILE* _file) {
-    TRACE_INFO("%s", "start");
+    TRACE_INFO("%s [%d]", "start", m_key);
 
     if (NULL == _file) {
         assert(false);
@@ -1146,3 +1110,61 @@ bool LogAppender::__writefile(const void* _data, size_t _len, FILE* _file) {
     TRACE_INFO("%s", "end");
     return true;
 }
+
+void LogAppender::__writetips2console(const char* _tips_format, ...) {
+    TRACE_INFO("%s", "start");
+
+    /* 格式化字符串打印至 console */
+    if (NULL == _tips_format) {
+        return;
+    }
+    XLoggerInfo info;
+    memset(&info, 0, sizeof(XLoggerInfo));
+    char tips_info[4096] = {0};
+    va_list ap;
+    va_start(ap, _tips_format);
+    vsnprintf(tips_info, sizeof(tips_info), _tips_format, ap);
+    va_end(ap);
+    ConsoleLog(&info, tips_info);
+
+    TRACE_INFO("%s", "end");
+}
+
+static LogAppender* __log_appender_factory(int key) {
+    TRACE_INFO("%s", "start")
+
+    ScopedLock map_lock(sg_mutex_key_logappender_map);
+    /* 如果存在直接返回 LogAppender */
+    TKey_Logappender_Map::iterator iter;
+    iter = sg_key_logappender_map.find(key);
+    if (iter != sg_key_logappender_map.end()) {
+        TRACE_INFO("%s", "end")
+        return iter->second;
+    }
+    if (sg_key_logappender_map_destroy) {
+        TRACE_INFO("%s", "end")
+        return NULL;
+    }
+
+    TRACE_INFO("Create LogAppender: [%d]", key)
+
+    /* 如果不存在则初始化 LogAppender */
+    LogAppender *logappender = new LogAppender(key);
+    logappender->init_buff(sg_logdir.c_str(), sg_logfileprefix.c_str(), sg_pub_key.c_str());
+
+    /* 测试接口 */
+    AutoBuffer tmp_buffer;
+    logappender->m_log_buff->Flush(tmp_buffer);
+    char mark_info[512] = {0};
+    get_mark_info(mark_info, sizeof(mark_info));
+    logappender->writetips2file("~~~~~ begin of mmap ~~~~~\n");
+    logappender->writetips2file("LogAppender Key [%d] use_mmap [%d]\n", key, logappender->m_use_mmap );
+    logappender->log2file(tmp_buffer.Ptr(), tmp_buffer.Length(), false);
+    logappender->writetips2file("%s\n", mark_info);
+    logappender->writetips2file("~~~~~ end of mmap ~~~~~\n");
+    sg_key_logappender_map.insert(TKey_Logappender_Pair(key, logappender));
+
+    TRACE_INFO("%s", "end")
+    return logappender;
+}
+
