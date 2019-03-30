@@ -136,10 +136,12 @@ namespace {
 #define TRACE_CALL
 #ifdef TRACE_CALL
 #include <android/log.h>
+#include <sys/syscall.h>
 #define __TRACE_INFO(...) __android_log_print(ANDROID_LOG_INFO, __FILE__, __VA_ARGS__);
-#define __TARCE_FORMAT(__fmt__) "[%s:%d] " __fmt__
+#define __TARCE_FORMAT(__fmt__) "[%s:%d][%ld] " __fmt__
+#define gettid() syscall(__NR_gettid)
 #define TRACE_INFO(__fmt__, ...) \
-    __TRACE_INFO(__TARCE_FORMAT(__fmt__), __func__, __LINE__, ##__VA_ARGS__);
+    __TRACE_INFO(__TARCE_FORMAT(__fmt__), __func__, __LINE__, gettid(), ##__VA_ARGS__);
 #else
 #define TRACE_INFO(fmt, ...) ((void)0)
 #endif
@@ -773,6 +775,7 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
     TRACE_INFO("%s [%d]", "start", m_key);
 
     if (NULL == _data || 0 == _len || sg_logdir.empty()) {
+        TRACE_INFO("%s", "end");
         return;
     }
 
@@ -785,6 +788,7 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
                 __closelogfile();
             }
         }
+        TRACE_INFO("%s", "end");
         return;
     }
 
@@ -801,6 +805,7 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
         }
 
         if (cache_logs || !_move_file) {
+            TRACE_INFO("%s", "end");
             return;
         }
 
@@ -812,6 +817,7 @@ void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
             }
             boost::filesystem::remove(logcachefilepath);
         }
+        TRACE_INFO("%s", "end");
         return;
     }
 
