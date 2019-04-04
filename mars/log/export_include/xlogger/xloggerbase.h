@@ -41,6 +41,7 @@ typedef enum {
 
 typedef struct XLoggerInfo_t {
     TLogLevel level;
+    const char* business;
     const char* tag;
     const char* filename;
     const char* func_name;

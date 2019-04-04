@@ -5,11 +5,11 @@ message(STATUS "CMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}")
 
 add_subdirectory(comm comm)
 add_subdirectory(boost boost)
-add_subdirectory(app app)
-add_subdirectory(baseevent baseevent)
+# add_subdirectory(app app)
+# add_subdirectory(baseevent baseevent)
 add_subdirectory(log xlog)
-add_subdirectory(sdt sdt)
-add_subdirectory(stn stn)
+# add_subdirectory(sdt sdt)
+# add_subdirectory(stn stn)
 
 
 project (mars)
@@ -26,7 +26,8 @@ if(ANDROID)
     find_library(log-lib log)
     find_library(z-lib z)
 
-    link_directories(app baseevent log sdt stn comm boost)
+    # link_directories(app baseevent log sdt stn comm boost)
+    link_directories(log comm boost)
 
     # marsxlog
     set(SELF_LIB_NAME marsxlog)
@@ -72,20 +73,12 @@ if(ANDROID)
     if(ANDROID_ABI STREQUAL "arm64-v8a")
         target_link_libraries(${SELF_LIB_NAME} "-Wl,--gc-sections"
                             ${log-lib}
-                            stn
-                            sdt
-                            app
-                            baseevent
                             comm
                             mars-boost
                             marsxlog)
     else()
         target_link_libraries(${SELF_LIB_NAME} "-Wl,--gc-sections -Wl,--version-script=\"${EXPORT_EXP_FILE}\""
                             ${log-lib}
-                            stn
-                            sdt
-                            app
-                            baseevent
                             comm
                             mars-boost
                             marsxlog)

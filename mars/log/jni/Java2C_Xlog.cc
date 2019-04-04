@@ -118,9 +118,9 @@ JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_logWrite
 
 }
 
-DEFINE_FIND_STATIC_METHOD(KXlog_logWrite2, KXlog, "logWrite2", "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;IIJJLjava/lang/String;)V")
+DEFINE_FIND_STATIC_METHOD(KXlog_logWrite2, KXlog, "logWrite2", "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;IIJJLjava/lang/String;)V")
 JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_logWrite2
-		(JNIEnv *env, jclass, int _level, jstring _tag, jstring _filename,
+		(JNIEnv *env, jclass, jstring _business, int _level, jstring _tag, jstring _filename,
 		 jstring _funcname, jint _line, jint _pid, jlong _tid, jlong _maintid, jstring _log) {
 
 	if (!xlogger_IsEnabledFor((TLogLevel)_level)) {
@@ -136,12 +136,17 @@ JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_logWrite2
 	xlog_info.maintid = LONGTHREADID2INT(_maintid);
 
 	const char* tag_cstr = NULL;
+	const char* business_cstr = NULL;
 	const char* filename_cstr = NULL;
 	const char* funcname_cstr = NULL;
 	const char* log_cstr = NULL;
 
 	if (NULL != _tag) {
 		tag_cstr = env->GetStringUTFChars(_tag, NULL);
+	}
+
+	if (NULL != _business) {
+		business_cstr = env->GetStringUTFChars(_business, NULL);
 	}
 
 	if (NULL != _filename) {
@@ -157,6 +162,7 @@ JNIEXPORT void JNICALL Java_com_tencent_mtt_log_engine_Xlog_logWrite2
 	}
 
 	xlog_info.tag = NULL == tag_cstr ? "" : tag_cstr;
+	xlog_info.business = NULL == business_cstr ? "" : business_cstr;
 	xlog_info.filename = NULL == filename_cstr ? "" : filename_cstr;
 	xlog_info.func_name = NULL == funcname_cstr ? "" : funcname_cstr;
 

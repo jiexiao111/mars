@@ -17,6 +17,7 @@ public class Xlog implements Log.LogImp {
 	static class XLoggerInfo {
 		public int level;
 		public String tag;
+		public String business;
 		public String filename;
 		public String funcname;
 		public int line;

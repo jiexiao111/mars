@@ -74,7 +74,7 @@ class LogAppender {
 
     public:
 
-        LogAppender(int key);
+        LogAppender(const char *key);
         ~LogAppender();
 
         void appender_sync(const XLoggerInfo* _info, const char* _log);
@@ -109,7 +109,7 @@ class LogAppender {
 
     private:
 
-        int m_key;                                    // 表示写入日志文件的 ID
+        std::string m_key;                                    // 表示写入日志文件的类别和级别
 
         FILE *m_logfile;                              // 日志文件描述符
         time_t m_openfiletime;                        // 日志文件的打开时间

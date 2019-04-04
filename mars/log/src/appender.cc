@@ -66,6 +66,7 @@
 #endif
 
 #define LOG_EXT "qlog"
+#define LOG_PREFIX "pangolin_"
 
 extern void log_formater(const XLoggerInfo* _info, const char* _logbody, PtrBuffer& _log);
 extern void ConsoleLog(const XLoggerInfo* _info, const char* _log);
@@ -99,7 +100,7 @@ static uint64_t sg_max_file_size = 0; // 0, will not split log file.
 static int sg_cache_log_days = 0;   // 0, will not cache logs
 
 static void __async_log_thread();
-static LogAppender* __log_appender_factory(int key);
+static LogAppender* __log_appender_factory(const char *key);
 static Thread sg_thread_async(&__async_log_thread);
 
 static const unsigned int kBufferBlockLength = 150 * 1024;
@@ -107,9 +108,9 @@ static const long kMaxLogAliveTime = 10 * 24 * 60 * 60;    // 10 days in second
 static const long kMinLogAliveTime = 24 * 60 * 60;    // 1 days in second
 static long sg_max_alive_time = kMaxLogAliveTime;
 
-typedef std::map<int, LogAppender* > TKey_Logappender_Map;
+typedef std::map<std::string, LogAppender* > TKey_Logappender_Map;
 TKey_Logappender_Map sg_key_logappender_map;
-typedef std::pair<int, LogAppender *> TKey_Logappender_Pair;
+typedef std::pair<std::string, LogAppender *> TKey_Logappender_Pair;
 
 namespace {
     class ScopeErrno {
@@ -347,9 +348,12 @@ void xlogger_appender(const XLoggerInfo* _info, const char* _log) {
     TRACE_INFO("%s", "start");
 
     /* 根据 level 获取对应的 LogAppender */
-    int log_file_key = (NULL == _info) ? DEFAULT_KEY : _info->level;
+    int log_file_level = (NULL == _info) ? DEFAULT_KEY : _info->level;
+    const char* log_business = (NULL == _info) ? "NA" : _info->business;
     LogAppender *logappender;
-    logappender = __log_appender_factory(log_file_key);
+    char catalog_level[256] = {0};
+    snprintf(catalog_level, sizeof(catalog_level), "%s_%d", log_business, log_file_level);
+    logappender = __log_appender_factory(catalog_level);
     if (NULL == logappender) { 
         TRACE_INFO("%s", "end");
         return;
@@ -617,10 +621,10 @@ void appender_set_max_alive_duration(long _max_time) {
     TRACE_INFO("%s", "end");
 }
 
-LogAppender::LogAppender(int key) {
+LogAppender::LogAppender(const char *key) {
     TRACE_INFO("%s", "start");
 
-    m_key = key;
+    m_key = std::string(key);
     m_mmmap_file = new boost::iostreams::mapped_file;
 
     m_log_buff = NULL;
@@ -656,8 +660,8 @@ bool LogAppender::init_buff(const char* _dir, const char* _nameprefix, const cha
     TRACE_INFO("%s", "start");
 
     char mmap_file_path[512] = {0};
-    snprintf(mmap_file_path, sizeof(mmap_file_path), "%s/%s.mmap%d",
-            sg_cache_logdir.empty() ? _dir : sg_cache_logdir.c_str(), _nameprefix, m_key);
+    snprintf(mmap_file_path, sizeof(mmap_file_path), "%s/%s.mmap_%s",
+            sg_cache_logdir.empty() ? _dir : sg_cache_logdir.c_str(), _nameprefix, m_key.c_str());
 
     ScopedLock buffer_lock(m_mutex_buffer_async);
     /* 创建 m_log_buff */
@@ -751,7 +755,7 @@ void LogAppender::appender_async(const XLoggerInfo* _info, const char* _log) {
 }
 
 void LogAppender::writetips2file(const char* _tips_format, ...) {
-    TRACE_INFO("%s [%d]", "start", m_key);
+    TRACE_INFO("%s [%s]", "start", m_key.c_str());
 
     if (NULL == _tips_format) {
         return;
@@ -772,7 +776,7 @@ void LogAppender::writetips2file(const char* _tips_format, ...) {
 }
 
 void LogAppender::log2file(const void* _data, size_t _len, bool _move_file) {
-    TRACE_INFO("%s [%d]", "start", m_key);
+    TRACE_INFO("%s [%s]", "start", m_key.c_str());
 
     if (NULL == _data || 0 == _len || sg_logdir.empty()) {
         TRACE_INFO("%s", "end");
@@ -980,12 +984,30 @@ std::string LogAppender::__make_logfilenameprefix(const timeval& _tv, const char
     time_t sec = _tv.tv_sec;
     tm tcur = *localtime((const time_t*)&sec);
 
-    char temp [64] = {0};
-    snprintf(temp, 64, "_%d%02d%02d%02d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon,
-            tcur.tm_mday, tcur.tm_hour, 0, m_key);//配合logsdk按照小时分割日志，分和秒变为0
+    /* 重组前缀 */
+    char delim[] = "_";
+    char part_1[256] = {0};
+    char copy_prefix[256] = {0};
+    strncpy(copy_prefix, _prefix, 255);
+    char *pack_path      = strtok(copy_prefix, delim); // 包路径
+    char *process_name   = strtok(NULL, delim); // 进程名
+    char *app_version    = strtok(NULL, delim); // app 版本号
+    strtok(NULL, delim); // 日志类型因为只能在初始化阶段传入, 无法打印日志时获取, 弃用
+    char *logsdk_version = strtok(NULL, delim); // logsdk 版本
+    assert(NULL != pack_path);
+    assert(NULL != process_name);
+    assert(NULL != app_version);
+    assert(NULL != logsdk_version);
+    snprintf(part_1, 256, "%s_%s_%s_%s_%s", pack_path, process_name, app_version, m_key.c_str(), logsdk_version);
 
-    std::string filenameprefix = _prefix;
-    filenameprefix += temp;
+    /* 前缀添加日期和时间,配合logsdk按照小时分割日志，分和秒变为0 */
+    char part_2[64] = {0};
+    snprintf(part_2, 64, "_%d%02d%02d%02d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon,
+            tcur.tm_mday, tcur.tm_hour, 0, 0);
+
+    std::string filenameprefix = LOG_PREFIX;
+    filenameprefix += part_1;
+    filenameprefix += part_2;
 
     TRACE_INFO("%s", "end");
     return filenameprefix;
@@ -1084,7 +1106,7 @@ bool LogAppender::__cache_logs() {
 }
 
 bool LogAppender::__writefile(const void* _data, size_t _len, FILE* _file) {
-    TRACE_INFO("%s [%d]", "start", m_key);
+    TRACE_INFO("%s [%s]", "start", m_key.c_str());
 
     if (NULL == _file) {
         assert(false);
@@ -1136,13 +1158,13 @@ void LogAppender::__writetips2console(const char* _tips_format, ...) {
     TRACE_INFO("%s", "end");
 }
 
-static LogAppender* __log_appender_factory(int key) {
+static LogAppender* __log_appender_factory(const char *catalog_level) {
     TRACE_INFO("%s", "start")
 
     ScopedLock map_lock(sg_mutex_key_logappender_map);
     /* 如果存在直接返回 LogAppender */
     TKey_Logappender_Map::iterator iter;
-    iter = sg_key_logappender_map.find(key);
+    iter = sg_key_logappender_map.find(catalog_level);
     if (iter != sg_key_logappender_map.end()) {
         TRACE_INFO("%s", "end")
         return iter->second;
@@ -1152,10 +1174,10 @@ static LogAppender* __log_appender_factory(int key) {
         return NULL;
     }
 
-    TRACE_INFO("Create LogAppender: [%d]", key)
+    TRACE_INFO("Create LogAppender: [%s]", catalog_level)
 
     /* 如果不存在则初始化 LogAppender */
-    LogAppender *logappender = new LogAppender(key);
+    LogAppender *logappender = new LogAppender(catalog_level);
     logappender->init_buff(sg_logdir.c_str(), sg_logfileprefix.c_str(), sg_pub_key.c_str());
 
     /* 测试接口 */
@@ -1164,11 +1186,11 @@ static LogAppender* __log_appender_factory(int key) {
     char mark_info[512] = {0};
     get_mark_info(mark_info, sizeof(mark_info));
     logappender->writetips2file("~~~~~ begin of mmap ~~~~~\n");
-    logappender->writetips2file("LogAppender Key [%d] use_mmap [%d]\n", key, logappender->m_use_mmap );
+    logappender->writetips2file("LogAppender Key [%s] use_mmap [%d]\n", catalog_level, logappender->m_use_mmap );
     logappender->log2file(tmp_buffer.Ptr(), tmp_buffer.Length(), false);
     logappender->writetips2file("%s\n", mark_info);
     logappender->writetips2file("~~~~~ end of mmap ~~~~~\n");
-    sg_key_logappender_map.insert(TKey_Logappender_Pair(key, logappender));
+    sg_key_logappender_map.insert(TKey_Logappender_Pair(catalog_level, logappender));
 
     TRACE_INFO("%s", "end")
     return logappender;
