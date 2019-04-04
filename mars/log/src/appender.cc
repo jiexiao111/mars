@@ -44,6 +44,7 @@
 
 #include <unistd.h>
 #include <zlib.h>
+/* #include <android/log.h> */
 
 #include <string>
 #include <algorithm>
@@ -73,7 +74,7 @@
 
 #include "log_buffer.h"
 
-#define LOG_EXT "xlog"
+#define LOG_EXT "qlog"
 
 extern void log_formater(const XLoggerInfo* _info, const char* _logbody, PtrBuffer& _log);
 extern void ConsoleLog(const XLoggerInfo* _info, const char* _log);
@@ -107,8 +108,8 @@ class ScopeErrno {
 
 XloggerAppender* XloggerAppender::NewInstance(TAppenderMode _mode, const char* _cachedir,
                                     const char* _logdir, const char* _nameprefix,
-                                    int _cache_days, const char* _pub_key) {
-    return new XloggerAppender(_mode, _cachedir, _logdir, _nameprefix, _cache_days, _pub_key);
+                                    int _cache_days, const char* _pub_key, const char* _log_head_info) {
+    return new XloggerAppender(_mode, _cachedir, _logdir, _nameprefix, _cache_days, _pub_key, _log_head_info);
 }
 
 void XloggerAppender::DelayRelease(XloggerAppender* _appender) {
@@ -126,9 +127,9 @@ void XloggerAppender::Release(XloggerAppender*& _appender) {
 }
 
 XloggerAppender::XloggerAppender(TAppenderMode _mode, const char* _cachedir, const char* _logdir,
-                        const char* _nameprefix, int _cache_days, const char* _pub_key)
+                        const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info)
                         : thread_async_(boost::bind(&XloggerAppender::__AsyncLogThread, this)) {
-    Open(_mode, _cachedir, _logdir, _nameprefix, _cache_days, _pub_key);
+    Open(_mode, _cachedir, _logdir, _nameprefix, _cache_days, _pub_key, _log_head_info);
 }
 
 void XloggerAppender::Write(const XLoggerInfo* _info, const char* _log) {
@@ -243,7 +244,7 @@ void XloggerAppender::Close() {
 
 void XloggerAppender::Open(TAppenderMode _mode, const char* _cachedir,
                              const char* _logdir, const char* _nameprefix,
-                             int _cache_days, const char* _pub_key) {
+                             int _cache_days, const char* _pub_key, const char* _log_head_info) {
 
     assert(nullptr != _logdir);
     assert(nullptr != _nameprefix);
@@ -251,6 +252,7 @@ void XloggerAppender::Open(TAppenderMode _mode, const char* _cachedir,
     cache_logdir_ = nullptr == _cachedir ? "" : _cachedir;
     logdir_ = nullptr == _logdir ? "" : _logdir;
     logfileprefix_ = nullptr == _nameprefix ? "" : _nameprefix;
+    log_head_info_ = nullptr == _log_head_info ? "" : _log_head_info;
     cache_log_days_ = _cache_days;
 
     ScopedLock dir_attr_lock(sg_mutex_dir_attr);
@@ -344,8 +346,9 @@ std::string XloggerAppender::__MakeLogFileNamePrefix(const timeval& _tv, const c
     tm tcur = *localtime((const time_t*)&sec);
     
     char temp [64] = {0};
-    snprintf(temp, 64, "_%d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon, tcur.tm_mday);
-    
+//    snprintf(temp, 64, "_%d%02d%02d%02d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon, tcur.tm_mday, tcur.tm_hour, tcur.tm_min, tcur.tm_sec);
+    snprintf(temp, 64, "_%d%02d%02d%02d%02d%02d", 1900 + tcur.tm_year, 1 + tcur.tm_mon, tcur.tm_mday, tcur.tm_hour, 0, 0);//配合logsdk按照小时分割日志，分和秒变为0
+
     std::string filenameprefix = _prefix;
     filenameprefix += temp;
     
@@ -695,6 +698,13 @@ bool XloggerAppender::__OpenLogFile(const std::string& _log_dir) {
     if (nullptr == logfile_) {
         __WriteTips2Console("open file error:%d %s, path:%s", errno, strerror(errno), logfilepath);
     }
+    //cirodeng-20180524:add common info in the head of each logfile(not encrypted)
+    char common_log[4096] = {0};
+    snprintf(common_log, sizeof(common_log), "%s\n", log_head_info_.c_str());
+    AutoBuffer tmp_common_buff;
+    log_buff_->Write(common_log, strnlen(common_log, sizeof(common_log)), tmp_common_buff);
+    __WriteFile(tmp_common_buff.Ptr(), tmp_common_buff.Length(), logfile_);
+
 
     if (0 != last_time_ && (now_time - last_time_) > (time_t)((now_tick - last_tick_) / 1000 + 300)) {
 
@@ -1088,16 +1098,16 @@ static void appender_release_default_appender() {
     XloggerAppender::Release(sg_default_appender);
 }
 
-void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefix, const char* _pub_key) {
+void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefix, const char* _pub_key, const char* _log_head_info) {
     assert(_dir);
     assert(_nameprefix);
     
-    appender_open_with_cache(_mode, "", _dir, _nameprefix, 0, _pub_key);
+    appender_open_with_cache(_mode, "", _dir, _nameprefix, 0, _pub_key, _log_head_info);
 }
 
 
 void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir, const std::string& _logdir,
-                              const char* _nameprefix, int _cache_days, const char* _pub_key) {
+                              const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info) {
     assert(!_logdir.empty());
     assert(_nameprefix);
 
@@ -1106,7 +1116,7 @@ void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir,
         return; 
     }
 
-    sg_default_appender = XloggerAppender::NewInstance(_mode, _cachedir.c_str(), _logdir.c_str(), _nameprefix, _cache_days, _pub_key);
+    sg_default_appender = XloggerAppender::NewInstance(_mode, _cachedir.c_str(), _logdir.c_str(), _nameprefix, _cache_days, _pub_key, _log_head_info);
     sg_release_guard = false;
     xlogger_SetAppender(&xlogger_appender);
     BOOT_RUN_EXIT(appender_release_default_appender);

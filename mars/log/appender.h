@@ -36,9 +36,10 @@ enum TAppenderMode
     kAppenderSync,
 };
 
-void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefix, const char* _pub_key);
+void appender_open(TAppenderMode _mode, const char* _dir, const char* _nameprefix, const char* _pub_key, const char* _log_head_info);
+//cirodeng-20180524:add log head info param
 void appender_open_with_cache(TAppenderMode _mode, const std::string& _cachedir, const std::string& _logdir,
-                              const char* _nameprefix, int _cache_days, const char* _pub_key);
+                              const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info);
 void appender_flush();
 void appender_flush_sync();
 void appender_close();
@@ -68,13 +69,13 @@ class XloggerAppender {
  public:
     static XloggerAppender* NewInstance(TAppenderMode _mode, const char* _cachedir,
                                         const char* _logdir, const char* _nameprefix,
-                                        int _cache_days, const char* _pub_key);
+                                        int _cache_days, const char* _pub_key, const char* _log_head_info);
     static void DelayRelease(XloggerAppender* _appender);
     static void Release(XloggerAppender*& _appender);
 
     void Open(TAppenderMode _mode, const char* _cachedir,
                     const char* _logdir, const char* _nameprefix,
-                    int _cache_days, const char* _pub_key);
+                    int _cache_days, const char* _pub_key, const char* _log_head_info);
 
     void Write(const XLoggerInfo* _info, const char* _log);
     void SetMode(TAppenderMode _mode);
@@ -96,7 +97,7 @@ class XloggerAppender {
 
  private:
     XloggerAppender(TAppenderMode _mode, const char* _cachedir, const char* _logdir,
-                        const char* _nameprefix, int _cache_days, const char* _pub_key);
+                        const char* _nameprefix, int _cache_days, const char* _pub_key, const char* _log_head_info);
 
     
     
@@ -136,6 +137,7 @@ class XloggerAppender {
     TAppenderMode mode_ = kAppenderAsync;
     std::string logdir_;
     std::string logfileprefix_;
+    std::string log_head_info_;
     std::string cache_logdir_;
     std::string current_dir_;
     int cache_log_days_ = 0;

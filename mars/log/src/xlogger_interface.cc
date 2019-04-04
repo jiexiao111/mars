@@ -34,7 +34,7 @@ static Mutex sg_mutex;
 static std::map<std::string, XloggerCategory*> sg_map;
 XloggerCategory* NewXloggerInstance(TLogLevel _level, TAppenderMode _mode, const char* _cachedir,
                                     const char* _logdir, const char* _nameprefix, int _cache_days,
-                                    const char* _pub_key) {
+                                    const char* _pub_key, const char* _log_head_info) {
 
     if (nullptr == _logdir || nullptr == _nameprefix) {
         return nullptr;
@@ -48,7 +48,7 @@ XloggerCategory* NewXloggerInstance(TLogLevel _level, TAppenderMode _mode, const
 
     XloggerAppender* appender = XloggerAppender::NewInstance(_mode, _cachedir,
                                                             _logdir, _nameprefix,
-                                                            _cache_days, _pub_key);
+                                                            _cache_days, _pub_key, _log_head_info);
 
     using namespace std::placeholders;
     XloggerCategory* category = XloggerCategory::NewInstance(reinterpret_cast<uintptr_t>(appender),
